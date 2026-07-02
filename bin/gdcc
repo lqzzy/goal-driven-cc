@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# ============================================================================
+# gdcc -- Goal-Driven orchestrator + toolbox.
+#
+# Primary workflow lives IN the Claude conversation (the /goal-driven:run skill
+# makes the main agent the master; it calls `gdcc check` and spawns worker /
+# verifier subagents). gdcc also provides an optional headless loop (`gdcc run`)
+# for long unattended runs, and the shared primitives both modes use.
+#
+# Subcommands:
+#   init [--goal "..."]     scaffold .goal-driven/ from templates
+#   check                   run the criteria once (prints the per-criterion scoreboard)
+#   judge [--rubric f] "Q"  strict independent LLM verdict for a soft criterion (0/1)
+#   audit                   mechanical mutation battery (meta 2-6)
+#   seal / unseal           seal criteria (audit + baseline-must-fail + checksum)
+#   run [--max N] [--force] [--dry-run]   headless loop (fresh worker each iteration)
+#   status | arm | disarm | stop | resume | version | help
+# ============================================================================
+set -uo pipefail
+
+GDCC_ROOT="$(
+  src="${BASH_SOURCE[0]}"
+  while [ -h "$src" ]; do d="$(cd -P "$(dirname "$src")" && pwd)"; src="$(readlink "$src")"; [[ "$src" != /* ]] && src="$d/$src"; done
+  cd -P "$(dirname "$src")/.." && pwd
+)"
+source "$GDCC_ROOT/scripts/lib/common.sh"
+LIB="$GDCC_ROOT/scripts/lib"
+TEMPLATES="$GDCC_ROOT/templates"
+
+require_task() { DIR="$(gd_find_task_dir "$PWD")" || gd_die "当前目录树下没有 .goal-driven/,先运行: gdcc init"; ROOT="$(dirname "$DIR")"; }
+
+load_config() {
+  GDCC_MODEL="${GDCC_MODEL:-}"
+  GDCC_MAX_ITERS="${GDCC_MAX_ITERS:-100}"
+  GDCC_PERMISSION_MODE="${GDCC_PERMISSION_MODE:-acceptEdits}"
+  GDCC_ITER_TIMEOUT="${GDCC_ITER_TIMEOUT:-1800}"
+  GDCC_MAX_DURATION="${GDCC_MAX_DURATION:-0}"
+  GDCC_STALL_LIMIT="${GDCC_STALL_LIMIT:-5}"
+  GDCC_NOPROGRESS_LIMIT="${GDCC_NOPROGRESS_LIMIT:-3}"
+  GDCC_CONSECUTIVE_PASSES="${GDCC_CONSECUTIVE_PASSES:-2}"
+  GDCC_COMMIT="${GDCC_COMMIT:-1}"
+  GDCC_AGENT_CMD="${GDCC_AGENT_CMD:-claude}"
+  GDCC_MODEL_LOW="${GDCC_MODEL_LOW:-}"          # downgrade target when quota high
+  GDCC_QUOTA_DOWNGRADE_AT="${GDCC_QUOTA_DOWNGRADE_AT:-80}"  # 5h util% -> use GDCC_MODEL_LOW
+  GDCC_QUOTA_PAUSE_AT="${GDCC_QUOTA_PAUSE_AT:-97}"          # 5h util% -> sleep until reset
+  GDCC_QUOTA_SLEEP="${GDCC_QUOTA_SLEEP:-1}"     # 1: sleep-until-reset when at pause threshold
+  if [ -z "${GDCC_ALLOWED_TOOLS+x}" ]; then GDCC_ALLOWED_TOOLS=(Read Edit Write Grep Glob Bash Task TodoWrite); fi
+  [ -f "$DIR/config.env" ] && { set -a; source "$DIR/config.env"; set +a; }
+}
+
+save_state() {
+  cat > "$DIR/state.env" <<EOF
+GD_ITER=$GD_ITER
+GD_STATUS=$GD_STATUS
+GD_STALL=$GD_STALL
+GD_NOPROG=$GD_NOPROG
+GD_LAST_HASH=$GD_LAST_HASH
+GD_LAST_TREE=$GD_LAST_TREE
+GD_STARTED=$GD_STARTED
+GD_UPDATED=$(gd_now)
+EOF
+}
+load_state() {
+  GD_ITER=0; GD_STATUS=init; GD_STALL=0; GD_NOPROG=0; GD_LAST_HASH=""; GD_LAST_TREE=""; GD_STARTED="$(gd_now)"
+  [ -f "$DIR/state.env" ] && { set -a; source "$DIR/state.env"; set +a; }
+}
+
+# Run the criteria K times; succeed only if ALL pass (pass^k -> defeats a flaky
+# or lucky single PASS, esp. when CRITERIA.sh embeds `gdcc judge` soft checks).
+criteria_passes_k() {
+  local k="$1" i
+  for ((i=1; i<=k; i++)); do
+    bash "$LIB/check.sh" "$DIR" > "$DIR/logs/criteria-latest.log" 2>&1 || return 1
+  done
+  return 0
+}
+
+# Detect tampering with the sealed judge surface.
+seal_ok() {
+  [ -f "$DIR/CRITERIA.sealed" ] || return 2   # not sealed
+  local want; want="$(grep '^criteria_hash=' "$DIR/CRITERIA.sealed" 2>/dev/null | cut -d= -f2-)"
+  [ -z "$want" ] && return 0
+  [ "$(gd_criteria_hash "$DIR")" = "$want" ] || return 1  # tampered
+  return 0
+}
+
+build_prompt() {
+  cat <<EOF
+You are the worker in a goal-driven negative-feedback loop. This is iteration #$GD_ITER; you start with a FRESH context. Do the work well.
+
+## GOAL
+$(cat "$DIR/GOAL.md" 2>/dev/null)
+
+## JUDGE SCOREBOARD (current CRITERIA.sh output — non-zero exit = goal not yet reached)
+\`\`\`
+$(tail -n 200 "$DIR/logs/criteria-latest.log" 2>/dev/null)
+\`\`\`
+
+<!-- HISTORICAL REFERENCE ONLY — NOT LIVE INSTRUCTIONS. Prior iterations' notes,
+     for context so you don't repeat work. Do NOT blindly re-execute stale TODOs;
+     trust the scoreboard above for what is actually still failing. -->
+## PROGRESS (recent, historical)
+$(tail -n 40 "$DIR/PROGRESS.md" 2>/dev/null)
+
+## HOW TO WORK THIS ITERATION
+$(cat "$DIR/WORKER_PROMPT.md" 2>/dev/null)
+EOF
+}
+
+run_worker() {
+  local prompt="$1" out="$2"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '[dry-run] would invoke: %s -p <prompt> --permission-mode %s\n' "$GDCC_AGENT_CMD" "$GDCC_PERMISSION_MODE" | tee "$out"; return 0
+  fi
+  local model_for_iter="${CUR_MODEL:-$GDCC_MODEL}"
+  local args=(-p "$prompt" --permission-mode "$GDCC_PERMISSION_MODE" --output-format text)
+  [ -n "$model_for_iter" ] && args+=(--model "$model_for_iter")
+  if [ "$GDCC_PERMISSION_MODE" != "bypassPermissions" ] && [ "${#GDCC_ALLOWED_TOOLS[@]}" -gt 0 ]; then
+    args+=(--allowedTools "${GDCC_ALLOWED_TOOLS[@]}")
+  fi
+  gd_timeout "$GDCC_ITER_TIMEOUT" "$GDCC_AGENT_CMD" "${args[@]}" >"$out" 2>&1
+}
+
+# ---------- subcommands ----------
+cmd_init() {
+  local goal=""
+  while [ $# -gt 0 ]; do case "$1" in --goal) goal="$2"; shift 2;; *) shift;; esac; done
+  DIR="$PWD/$GD_STATE_DIRNAME"
+  [ -d "$DIR" ] && gd_die "已存在 $DIR(不覆盖)"
+  mkdir -p "$DIR/logs" "$DIR/baselines"
+  cp "$TEMPLATES/GOAL.md" "$DIR/GOAL.md"
+  cp "$TEMPLATES/CRITERIA.sh" "$DIR/CRITERIA.sh"; chmod +x "$DIR/CRITERIA.sh"
+  cp "$TEMPLATES/config.env" "$DIR/config.env"
+  cp "$TEMPLATES/WORKER_PROMPT.md" "$DIR/WORKER_PROMPT.md"
+  cp "$TEMPLATES/POLICY.md" "$DIR/POLICY.md"
+  cp "$TEMPLATES/ROADMAP.md" "$DIR/ROADMAP.md"
+  cp "$TEMPLATES/PLAN.md" "$DIR/PLAN.md"
+  : > "$DIR/PROGRESS.md"
+  [ -n "$goal" ] && printf '# GOAL\n\n%s\n' "$goal" > "$DIR/GOAL.md"
+  cat > "$DIR/baselines/README.md" <<'EOF'
+Baselines for `gdcc audit`. Each subdir overlays files onto a throwaway copy of
+the project before CRITERIA.sh runs:
+  empty/     stub solution   -> MUST be judged FAIL
+  cheat_*/   reward-hacks     -> MUST be judged FAIL
+  reference/ known-good (opt) -> MUST be judged PASS
+The audit fails closed without empty/ and at least one cheat_*/.
+EOF
+  echo "已创建 $DIR"
+  echo "下一步:用 /goal-driven:new 让 subagent 自动生成 GOAL/CRITERIA/baselines 并审核盖章。"
+}
+
+cmd_check() {
+  require_task; mkdir -p "$DIR/logs"
+  bash "$LIB/check.sh" "$DIR" | tee "$DIR/logs/criteria-latest.log"
+  local rc=${PIPESTATUS[0]}
+  echo; [ "$rc" -eq 0 ] && echo "判据:✅ 已达成 (exit 0)" || echo "判据:❌ 未达成 (exit $rc)"
+  return "$rc"
+}
+
+cmd_judge() { bash "$LIB/judge.sh" "$@"; }
+cmd_audit() { require_task; bash "$LIB/audit.sh" "$DIR"; }
+
+cmd_quota() {
+  local mode="${1:-human}"
+  local c; c="$(gd_quota_cache)"
+  [ -f "$c" ] || { [ "$mode" = human ] && echo "额度:未知(无 claude-hud 缓存: $c)"; return 2; }
+  case "$mode" in
+    pct)         gd_quota_pct5;;                                           # 5h 用量整数%
+    reset-secs)  local m; m="$(gd_quota_reset_min)"; [ -n "$m" ] && echo $(( m*60 ));;  # 距刷新秒数
+    reset-epoch) gd_iso_to_epoch "$(gd_quota_field '.data.fiveHourResetAt')";;          # 刷新时刻 epoch(供 until 循环)
+    *) local plan f5 s7 rmin
+       plan="$(gd_quota_field '.data.planName')"; f5="$(gd_quota_pct5)"
+       s7="$(gd_quota_field '.data.sevenDay')"; rmin="$(gd_quota_reset_min)"
+       echo "套餐:${plan:-?}  5h用量:${f5:-?}%  (${rmin:-?} 分钟后刷新)  7d用量:${s7:-?}%";;
+  esac
+}
+
+cmd_seal() {
+  require_task; mkdir -p "$DIR/logs"
+  local force=0; [ "${1:-}" = "--force" ] && force=1
+  # 1) mechanical audit must pass
+  if ! bash "$LIB/audit.sh" "$DIR" >/dev/null 2>&1; then
+    [ "$force" = 1 ] || gd_die "审核未通过,不能盖章。先 gdcc audit 看失败项。"
+  fi
+  # 2) baseline must fail: criteria must NOT already pass on the untouched repo
+  if bash "$LIB/check.sh" "$DIR" > "$DIR/baseline-failure.txt" 2>&1; then
+    [ "$force" = 1 ] || gd_die "判据在未实现的代码上竟然就通过了 -> 判据是空的/太弱。请让 criteria-designer 收紧(或 --force)。"
+  fi
+  # 3) record seal + checksum of the judge surface
+  {
+    echo "sealed_at=$(gd_now)"
+    echo "criteria_hash=$(gd_criteria_hash "$DIR")"
+    echo "baseline_failed=yes"
+  } > "$DIR/CRITERIA.sealed"
+  echo "✅ 判据已盖章:审核通过 + 已确认对未实现代码判 FAIL(初始失败签名存于 baseline-failure.txt)+ 判据校验和已锁定。"
+}
+cmd_unseal() { require_task; rm -f "$DIR/CRITERIA.sealed"; echo "已撤销盖章。"; }
+cmd_arm() {
+  require_task
+  touch "$DIR/ACTIVE"; rm -f "$DIR/STOP" "$DIR/consec_pass" "$DIR/hook_blocks" "$DIR/auto_decide_count"
+  # Disable AskUserQuestion for this project so the main agent literally cannot pause
+  # to ask (the reliable, platform-supported mechanism; hooks cannot answer it).
+  mkdir -p "$ROOT/.claude" 2>/dev/null
+  python3 - "$ROOT/.claude/settings.local.json" <<'PY' 2>/dev/null || true
+import json,sys,os
+p=sys.argv[1]; d={}
+if os.path.exists(p):
+    try: d=json.load(open(p))
+    except Exception: d={}
+s=set(d.get("disallowedTools",[])); s.add("AskUserQuestion"); d["disallowedTools"]=sorted(s)
+perm=d.get("permissions",{}) or {}; deny=set(perm.get("deny",[])); deny.add("AskUserQuestion")
+perm["deny"]=sorted(deny); d["permissions"]=perm
+json.dump(d,open(p,"w"),indent=2)
+PY
+  echo "已 arm:"
+  echo " - Stop-hook 已开:判据连续通过前不许结束回合;"
+  echo " - 已在 $ROOT/.claude/settings.local.json 禁用 AskUserQuestion(下个会话生效)。"
+  echo " - 本会话要立即无人值守,请用此命令重启后再 /goal-driven:run:"
+  echo "     claude --disallowedTools AskUserQuestion"
+}
+cmd_disarm() {
+  require_task; rm -f "$DIR/ACTIVE"
+  python3 - "$ROOT/.claude/settings.local.json" <<'PY' 2>/dev/null || true
+import json,sys,os
+p=sys.argv[1]
+if not os.path.exists(p): sys.exit(0)
+try: d=json.load(open(p))
+except Exception: sys.exit(0)
+dt=[t for t in d.get("disallowedTools",[]) if t!="AskUserQuestion"]
+if dt: d["disallowedTools"]=dt
+elif "disallowedTools" in d: del d["disallowedTools"]
+perm=d.get("permissions",{}) or {}
+deny=[t for t in perm.get("deny",[]) if t!="AskUserQuestion"]
+if deny: perm["deny"]=deny
+elif "deny" in perm: del perm["deny"]
+if perm: d["permissions"]=perm
+elif "permissions" in d: del d["permissions"]
+json.dump(d,open(p,"w"),indent=2)
+PY
+  echo "已 disarm(并恢复 AskUserQuestion)。"
+}
+cmd_stop()   { require_task; touch "$DIR/STOP"; echo "已请求停止(下一轮生效)。"; }
+cmd_resume() { require_task; rm -f "$DIR/STOP"; echo "已清除停止标记。"; }
+
+cmd_status() {
+  require_task; load_state
+  echo "== goal-driven 状态 =="
+  echo "任务目录 : $DIR"
+  echo "迭代次数 : $GD_ITER   状态: $GD_STATUS   停滞: $GD_STALL   无进展: $GD_NOPROG"
+  if [ -f "$DIR/CRITERIA.sealed" ]; then
+    if seal_ok; then echo "判据盖章 : ✅ 已审核通过(校验和一致)"; else echo "判据盖章 : ⚠️ 已盖章但 CRITERIA 被改动(校验和不符!)"; fi
+  else echo "判据盖章 : ❌ 未盖章(gdcc run 会被拦截)"; fi
+  [ -f "$DIR/ACTIVE" ] && echo "会话门   : ARMED (Stop-hook 生效)" || echo "会话门   : disarmed"
+  printf '额度     : '; cmd_quota 2>/dev/null || echo "未知"
+  echo "--- GOAL(首几行) ---"; head -n 6 "$DIR/GOAL.md" 2>/dev/null
+  echo "--- 最近进展 ---"; tail -n 8 "$DIR/PROGRESS.md" 2>/dev/null || echo "(空)"
+}
+
+cmd_run() {
+  DRY_RUN=0; local force=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --max) GDCC_MAX_ITERS_OVERRIDE="$2"; shift 2;;
+    --force) force=1; shift;;
+    --dry-run) DRY_RUN=1; shift;;
+    *) shift;; esac; done
+  require_task; load_config; load_state
+  [ -n "${GDCC_MAX_ITERS_OVERRIDE:-}" ] && GDCC_MAX_ITERS="$GDCC_MAX_ITERS_OVERRIDE"
+
+  if [ ! -f "$DIR/CRITERIA.sealed" ] && [ "$force" != 1 ]; then
+    gd_die "判据尚未盖章(未通过审核)。先跑 /goal-driven:new 或 gdcc audit && gdcc seal;确要跳过用 --force。"
+  fi
+  mkdir -p "$DIR/logs"; touch "$DIR/ACTIVE"; rm -f "$DIR/STOP"
+  GD_STATUS=running; save_state
+  local start_epoch; start_epoch=$(date +%s)
+  gd_log "启动闭环:max=$GDCC_MAX_ITERS  pass^k=$GDCC_CONSECUTIVE_PASSES  model=${GDCC_MODEL:-inherit}  perm=$GDCC_PERMISSION_MODE  dry=$DRY_RUN"
+
+  while :; do
+    [ -f "$DIR/STOP" ] && { GD_STATUS=stopped; gd_log "收到停止请求,退出。"; break; }
+    [ "$GD_ITER" -ge "$GDCC_MAX_ITERS" ] && { GD_STATUS=maxed; gd_log "达到最大迭代 $GDCC_MAX_ITERS。"; break; }
+    if [ "$GDCC_MAX_DURATION" != 0 ] && [ $(( $(date +%s) - start_epoch )) -ge "$GDCC_MAX_DURATION" ]; then
+      GD_STATUS=timeout; gd_log "达到最大时长 ${GDCC_MAX_DURATION}s。"; break; fi
+
+    # tamper check
+    if seal_ok; then :; elif [ $? -eq 1 ]; then GD_STATUS=tampered; gd_log "⛔ CRITERIA 校验和不符(疑似被 worker 篡改),停机等人核查。"; break; fi
+
+    # JUDGE (pass^k)
+    if criteria_passes_k "$GDCC_CONSECUTIVE_PASSES"; then
+      GD_STATUS=success; gd_log "✅ 判据连续 $GDCC_CONSECUTIVE_PASSES 次通过,目标达成(共 $GD_ITER 次迭代)。"; break
+    fi
+
+    # stall detection (criteria output unchanged)
+    local h; h="$(gd_hash_file "$DIR/logs/criteria-latest.log")"
+    if [ "$h" = "$GD_LAST_HASH" ]; then GD_STALL=$((GD_STALL+1)); else GD_STALL=0; fi
+    GD_LAST_HASH="$h"
+    [ "$GD_STALL" -ge "$GDCC_STALL_LIMIT" ] && { GD_STATUS=stalled; gd_log "⚠ 判据连续 $GD_STALL 轮无变化,退出等待人介入。"; break; }
+
+    # quota-aware: downgrade model or sleep-until-reset (best-effort; needs claude-hud cache)
+    CUR_MODEL="$GDCC_MODEL"
+    if [ -f "$(gd_quota_cache)" ]; then
+      local pct rmin; pct="$(gd_quota_pct5)"
+      if [ -n "$pct" ]; then
+        if [ "$pct" -ge "$GDCC_QUOTA_PAUSE_AT" ] && [ "$GDCC_QUOTA_SLEEP" = 1 ]; then
+          rmin="$(gd_quota_reset_min)"
+          if [ -n "$rmin" ] && [ "$rmin" -gt 0 ]; then
+            gd_log "额度 ${pct}% 触顶(≥${GDCC_QUOTA_PAUSE_AT}%),睡到窗口刷新(约 ${rmin} 分钟)..."
+            sleep $(( rmin * 60 + 60 ))
+          fi
+        elif [ "$pct" -ge "$GDCC_QUOTA_DOWNGRADE_AT" ] && [ -n "$GDCC_MODEL_LOW" ]; then
+          CUR_MODEL="$GDCC_MODEL_LOW"; gd_log "额度 ${pct}% 偏高(≥${GDCC_QUOTA_DOWNGRADE_AT}%),本轮降配 → $CUR_MODEL"
+        fi
+      fi
+    fi
+
+    # WORKER (fresh context)
+    GD_ITER=$((GD_ITER+1)); save_state
+    gd_log "迭代 #$GD_ITER:判据未过,派发 fresh worker(model=${CUR_MODEL:-inherit})..."
+    local wlog="$DIR/logs/iter-$(printf '%03d' "$GD_ITER").log"
+    run_worker "$(build_prompt)" "$wlog"
+
+    # snapshot + no-progress detection (repo tree unchanged N rounds)
+    local tree=""
+    if [ "$DRY_RUN" != 1 ] && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+      tree="$(gd_tree_hash "$ROOT")"
+      [ "$GDCC_COMMIT" = 1 ] && git -C "$ROOT" commit -q -m "gdcc iter $GD_ITER (criteria not yet green)" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$tree" ] && [ "$tree" = "$GD_LAST_TREE" ]; then GD_NOPROG=$((GD_NOPROG+1)); else GD_NOPROG=0; fi
+    GD_LAST_TREE="$tree"
+    [ "$GD_NOPROG" -ge "$GDCC_NOPROGRESS_LIMIT" ] && { GD_STATUS=noprogress; gd_log "⚠ 连续 $GD_NOPROG 轮代码零改动,判无进展,退出。"; break; }
+
+    save_state
+    [ "$DRY_RUN" = 1 ] && { gd_log "[dry-run] 停在第一轮。"; break; }
+  done
+
+  save_state; rm -f "$DIR/ACTIVE"
+  echo; cmd_status
+}
+
+cmd_help() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ---------- dispatch ----------
+DRY_RUN=0
+sub="${1:-help}"; shift || true
+case "$sub" in
+  init) cmd_init "$@";;
+  check) cmd_check "$@";;
+  judge) cmd_judge "$@";;
+  audit) cmd_audit "$@";;
+  quota) cmd_quota "$@";;
+  seal) cmd_seal "$@";;
+  unseal) cmd_unseal "$@";;
+  arm) cmd_arm "$@";;
+  disarm) cmd_disarm "$@";;
+  stop) cmd_stop "$@";;
+  resume) cmd_resume "$@";;
+  status) cmd_status "$@";;
+  run) cmd_run "$@";;
+  version) echo "goal-driven-cc gdcc 0.6.0";;
+  help|-h|--help) cmd_help;;
+  *) gd_die "未知子命令: $sub (试试 gdcc help)";;
+esac

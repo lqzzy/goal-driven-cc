@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# gd-audit -- convenience entrypoint for the criteria audit engine.
+# Equivalent to `gdcc audit`. Usable as a bare command when the plugin is enabled.
+set -uo pipefail
+ROOT="$(
+  src="${BASH_SOURCE[0]}"
+  while [ -h "$src" ]; do d="$(cd -P "$(dirname "$src")" && pwd)"; src="$(readlink "$src")"; [[ "$src" != /* ]] && src="$d/$src"; done
+  cd -P "$(dirname "$src")/.." && pwd
+)"
+exec bash "$ROOT/scripts/lib/audit.sh" "$@"

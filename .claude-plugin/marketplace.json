@@ -1,0 +1,16 @@
+{
+  "name": "goal-driven-cc",
+  "owner": {
+    "name": "qili"
+  },
+  "description": "Goal-Driven workflow for Claude Code: one-line goal -> verifiable, self-audited criteria -> autonomous negative-feedback loop until the criteria pass.",
+  "plugins": [
+    {
+      "name": "goal-driven",
+      "source": "./",
+      "description": "Turn a one-line goal into verifiable, adversarially-audited criteria, then loop subagents in-conversation until they genuinely pass.",
+      "version": "0.6.0",
+      "keywords": ["goal-driven", "autonomous-agent", "control-theory"]
+    }
+  ]
+}

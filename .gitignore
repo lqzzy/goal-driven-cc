@@ -1,0 +1,13 @@
+# goal-driven per-task runtime artifacts (state, not source)
+**/.goal-driven/logs/
+**/.goal-driven/state.env
+**/.goal-driven/ACTIVE
+**/.goal-driven/STOP
+**/.goal-driven/hook_blocks
+**/.goal-driven/CRITERIA.sealed
+**/.goal-driven/audit-report.md
+
+# python / os noise
+__pycache__/
+*.pyc
+.DS_Store

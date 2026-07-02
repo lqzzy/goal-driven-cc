@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# ============================================================================
+# audit.sh -- Criteria audit engine (mechanical meta-criteria verification).
+# ----------------------------------------------------------------------------
+# Control-theory view: the criteria ARE the sensor. This script calibrates the
+# sensor objectively with adversarial mutation testing, so "auto-review" is not
+# "another LLM's opinion" but a mechanical fact:
+#   2. discrimination floor : an EMPTY-solution baseline MUST be judged FAIL
+#   4. anti-cheat           : each CHEAT-solution baseline MUST be judged FAIL
+#   3. discrimination ceiling: a REFERENCE-solution baseline MUST be judged PASS (optional)
+#   5. non-flaky            : N repeated runs agree
+#   6. fast enough          : one criteria run < time budget
+# All of these must hold before criteria may be sealed. Semantic coverage
+# (meta-criterion 7) is reviewed separately by the criteria-auditor subagent.
+#
+# Baseline layout (produced by the criteria-designer subagent):
+#   .goal-driven/baselines/empty/       solution replaced by a stub  -> expect FAIL
+#   .goal-driven/baselines/cheat_*/     reward-hacking solutions      -> expect FAIL
+#   .goal-driven/baselines/reference/   a known-good solution (opt.)  -> expect PASS
+# Each baseline dir holds files laid out relative to the project root; they are
+# overlaid onto a throwaway copy of the project, then CRITERIA.sh is run there.
+#
+# Usage: audit.sh [task-dir]     Exit code 0 = criteria mechanically trustworthy.
+# ============================================================================
+set -uo pipefail
+
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
+DIR="${1:-}"
+[ -z "$DIR" ] && { DIR="$(gd_find_task_dir "$PWD")" || gd_die "no .goal-driven/ task dir found"; }
+ROOT="$(dirname "$DIR")"
+CRIT="$DIR/CRITERIA.sh"
+[ -f "$CRIT" ] || gd_die "missing $CRIT"
+
+[ -f "$DIR/config.env" ] && { set -a; source "$DIR/config.env"; set +a; }
+BUDGET="${GDCC_CRITERIA_BUDGET:-120}"
+DRUNS="${GDCC_DETERMINISM_RUNS:-3}"
+BASE_DIR="$DIR/baselines"
+REPORT="$DIR/audit-report.md"
+mkdir -p "$DIR/logs"
+
+FAILS=0
+LINES=()
+row() { LINES+=("$1"); printf '%s\n' "$1"; }
+
+# Copy project root to a temp dir, overlay a baseline, run CRITERIA.sh there.
+run_with_overlay() {
+  local overlay="$1" tmp rc
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/gdaudit.XXXXXX")" || return 99
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a \
+      --exclude '.git' --exclude 'node_modules' --exclude '__pycache__' \
+      --exclude '.venv' --exclude 'venv' --exclude 'target' --exclude 'build' \
+      --exclude 'dist' --exclude '.goal-driven/logs' \
+      "$ROOT"/ "$tmp"/ >/dev/null 2>&1
+  else
+    cp -R "$ROOT"/. "$tmp"/ 2>/dev/null
+    rm -rf "$tmp/.git" "$tmp/node_modules" "$tmp/.goal-driven/logs" 2>/dev/null
+  fi
+  [ -n "$overlay" ] && [ -d "$overlay" ] && cp -R "$overlay"/. "$tmp"/ 2>/dev/null
+  ( cd "$tmp" && gd_timeout "$BUDGET" bash "$tmp/.goal-driven/CRITERIA.sh" ) >/dev/null 2>&1
+  rc=$?
+  rm -rf "$tmp"
+  return $rc
+}
+verdict() { [ "$1" -eq 0 ] && echo PASS || echo FAIL; }
+
+row "# Criteria Audit Report (gd-audit)"
+row ""
+row "Task: \`$DIR\`  |  budget: ${BUDGET}s  |  determinism runs: ${DRUNS}"
+row ""
+row "| # | Meta-criterion | Expect | Actual | Result |"
+row "|---|---|---|---|---|"
+
+# ---- meta 5 (non-flaky) + meta 6 (fast): repeat current solution DRUNS times ----
+first_rc=""; determ_ok=1; t0=$(date +%s)
+for _ in $(seq 1 "$DRUNS"); do
+  run_with_overlay ""; rc=$?
+  [ -z "$first_rc" ] && first_rc=$rc
+  [ "$(verdict "$rc")" != "$(verdict "$first_rc")" ] && determ_ok=0
+done
+t1=$(date +%s); per=$(( (t1 - t0) / DRUNS ))
+if [ "$determ_ok" -eq 1 ]; then row "| 5 | non-flaky (${DRUNS}x) | agree | agree | PASS |"; else row "| 5 | non-flaky (${DRUNS}x) | agree | **jitter** | FAIL |"; FAILS=$((FAILS+1)); fi
+if [ "$per" -le "$BUDGET" ]; then row "| 6 | fast enough | <=${BUDGET}s | ~${per}s | PASS |"; else row "| 6 | fast enough | <=${BUDGET}s | ~${per}s | FAIL |"; FAILS=$((FAILS+1)); fi
+
+# ---- meta 2 (floor) + meta 4 (anti-cheat) + meta 3 (ceiling) via baselines ----
+have_empty=0; have_cheat=0
+if [ -d "$BASE_DIR" ]; then
+  for b in "$BASE_DIR"/*/; do
+    [ -d "$b" ] || continue
+    name="$(basename "$b")"
+    run_with_overlay "$b"; v="$(verdict $?)"
+    case "$name" in
+      empty*)     have_empty=1; if [ "$v" = FAIL ]; then row "| 2 | empty baseline \`$name\` | FAIL | $v | PASS |"; else row "| 2 | empty baseline \`$name\` | FAIL | $v | FAIL |"; FAILS=$((FAILS+1)); fi ;;
+      cheat*)     have_cheat=1; if [ "$v" = FAIL ]; then row "| 4 | cheat baseline \`$name\` | FAIL | $v | PASS |"; else row "| 4 | cheat baseline \`$name\` | FAIL | $v | FAIL |"; FAILS=$((FAILS+1)); fi ;;
+      reference*) if [ "$v" = PASS ]; then row "| 3 | reference baseline \`$name\` | PASS | $v | PASS |"; else row "| 3 | reference baseline \`$name\` | PASS | $v | FAIL |"; FAILS=$((FAILS+1)); fi ;;
+      *)          row "| - | unknown baseline \`$name\` (skipped) | - | - | SKIP |" ;;
+    esac
+  done
+fi
+
+# ---- fail-closed: without empty/cheat baselines the criteria are untested ----
+[ "$have_empty" -eq 0 ] && { row "| 2 | empty baseline | required | **missing** | FAIL |"; FAILS=$((FAILS+1)); }
+[ "$have_cheat" -eq 0 ] && { row "| 4 | cheat baseline | required | **missing** | FAIL |"; FAILS=$((FAILS+1)); }
+
+row ""
+if [ "$FAILS" -eq 0 ]; then
+  row "## Verdict: PASS -- criteria are mechanically trustworthy (meta 2-6)."
+  row "Next: criteria-auditor subagent must still review semantic coverage (meta 7: every GOAL requirement maps to an assertion)."
+else
+  row "## Verdict: FAIL -- $FAILS check(s) failed. Criteria must NOT be sealed."
+  row "criteria-designer must strengthen them (add baselines / tighten assertions / remove flakiness / speed up)."
+fi
+
+printf '%s\n' "${LINES[@]}" > "$REPORT"
+exit "$FAILS"

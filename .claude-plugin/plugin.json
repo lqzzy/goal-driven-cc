@@ -1,0 +1,22 @@
+{
+  "name": "goal-driven",
+  "displayName": "Goal-Driven for Claude Code",
+  "version": "0.6.0",
+  "description": "Turn a one-line goal into verifiable criteria, adversarially auto-audit those criteria against reward-hacking, then run an in-conversation negative-feedback subagent loop until the criteria genuinely pass. The control-theory closed loop for autonomous coding.",
+  "author": {
+    "name": "qili"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/qili/goal-driven-cc",
+  "repository": "https://github.com/qili/goal-driven-cc",
+  "keywords": [
+    "goal-driven",
+    "autonomous-agent",
+    "agent-loop",
+    "verifiable-criteria",
+    "control-theory",
+    "negative-feedback",
+    "tdd",
+    "reward-hacking"
+  ]
+}
