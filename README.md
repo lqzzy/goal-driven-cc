@@ -23,16 +23,13 @@ A Claude Code plugin that turns coding into a **closed control loop**: you defin
 ---
 
 ```text
-you ▸  /goal-driven:go  implement an LRU cache in this repo that passes all unit tests
+you ▸ /goal-driven:go  implement an LRU cache that passes all unit tests
 
-CC  ▸  ① co-design the goal / criteria / tech plan with you (the only step you're in)… ✅ sealed
-       ② ▶ phase 1/2 core structure · worker iterating…
-          gdcc check →  C1 [PASS]  C2 [FAIL]  C3 [FAIL]
-       … runs unattended · brainstorms before it ever gives up · waits out quota limits …
-       ③ ✅ GOAL VERIFICATION: ACHIEVED — criteria green twice in a row, wrapped up on its own
+CC  ▸ ① co-design goal · criteria · plan with you   →  ✅ sealed
+      ② run unattended:  worker → gdcc check → C1 ✓  C2 ✗  C3 ✗ → keep going
+         · brainstorms before it gives up · waits out quota limits ·
+      ③ ✅ GOAL VERIFICATION: ACHIEVED  —  green twice in a row, wrapped up on its own
 ```
-
-> **The key idea.** The criteria (`CRITERIA.sh`) are the **sensor** of the loop. If the sensor is wrong, stronger feedback just converges more confidently on the wrong thing. So Goal-Driven spends its effort where it matters most — **co-designing the criteria with you, then auditing them objectively** — instead of "asking another LLM if it looks fine."
 
 <br/>
 
