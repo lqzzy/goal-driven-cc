@@ -1,210 +1,229 @@
-# Goal-Driven for Claude Code
+<div align="center">
 
-> 你只给**一句话目标**。插件的 subagent 自动把它提炼成规格、合成**可执行判据 + 对抗测试**、**对抗式自审**判据是否可信;审核盖章后,主 CC 在**对话里**当 master,反复派 worker 干活,直到判据**真正**全绿——全程不进终端、无需人工按小时干预。
+# ◉ Goal-Driven for Claude Code
 
-控制论**负反馈**在 coding agent 上最直接的实践:
+**Give it a one-line goal. Get a result that's actually met.**
 
-- **判据(`CRITERIA.sh`)= 传感器**,客观测量"目标达成没有"。
-- **master = 对话里的主 CC**(+ Stop-hook 兜底),判据不过就派 worker、绝不提前收手。
-- **worker(子代理,独立上下文)= 执行机构**,读失败项做最小真实改动。
+A Claude Code plugin that turns coding into a **closed control loop**: you define the goal and verifiable criteria, a master agent supervises worker agents in a negative-feedback loop until the criteria *genuinely* pass — right in the conversation, no babysitting.
 
-命门在于:**传感器测错了,反馈越强越自信地收敛到错的地方**。所以本项目把最大精力放在**自动构建 + 自动审核判据**上,并把"自动审核"做成**客观的变异测试**,而不是"再让一个 LLM 觉得行"。
+<br/>
 
----
+[![version](https://img.shields.io/badge/version-0.10.0-2563eb?style=flat-square)](./CHANGELOG.md)
+[![license](https://img.shields.io/badge/license-MIT-16a34a?style=flat-square)](./LICENSE)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-8b5cf6?style=flat-square)](https://docs.claude.com/en/docs/claude-code)
+[![status](https://img.shields.io/badge/status-alpha-f59e0b?style=flat-square)](#-roadmap)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-ec4899?style=flat-square)](#-contributing)
 
-## 两层嵌套闭环
+<br/>
 
-```
-一句话目标
-   ▼
-┌ 环 A:判据构建(全 subagent 自动) ────────────────────────────┐
-│ goal-analyst      一句话(+2~3 反问)→ 结构化 GOAL.md          │
-│ criteria-designer GOAL → CRITERIA.sh(记分板)+ 测试 + 对抗基线 │
-│ criteria-auditor  gdcc audit(机械)+ 覆盖复核 → 不达标打回      │
-│                   达标 → gdcc seal(验"未实现必挂"+ 锁校验和)    │
-└──────────────── 判据可信、已盖章 ────────────────────────────────┘
-   │  (硬门:未盖章不许进环 B)
-   ▼
-┌ 环 B:解构建(master = 对话里的主 CC,全程不进终端) ───────────┐
-│ while (判据不过) { 派 goal-worker 子代理修失败项 → 重跑判据 }    │
-│ 判据连续 k 次过 → 起 goal-verifier 复核作弊/软条件 → 真达成才停   │
-│ Stop-hook 兜底:主 CC 想提前停就拦下,重跑判据逼着继续           │
-└──────────────────────────────────────────────────────────────────┘
-```
+[**Quick start**](#-install) · [**Why**](#-what-it-solves) · [**How it works**](#-how-it-works) · [**Commands**](#-commands) · [**Config**](#️-configuration)
+
+</div>
 
 ---
 
-## 安装(标准插件,一键)
+```text
+you ▸  /goal-driven:go  implement an LRU cache in this repo that passes all unit tests
 
-本仓库既是**插件**又是**市场**:
-
+CC  ▸  ① co-design the goal / criteria / tech plan with you (the only step you're in)… ✅ sealed
+       ② ▶ phase 1/2 core structure · worker iterating…
+          gdcc check →  C1 [PASS]  C2 [FAIL]  C3 [FAIL]
+       … runs unattended · brainstorms before it ever gives up · waits out quota limits …
+       ③ ✅ GOAL VERIFICATION: ACHIEVED — criteria green twice in a row, wrapped up on its own
 ```
-/plugin marketplace add <owner>/goal-driven-cc
+
+> **The key idea.** The criteria (`CRITERIA.sh`) are the **sensor** of the loop. If the sensor is wrong, stronger feedback just converges more confidently on the wrong thing. So Goal-Driven spends its effort where it matters most — **co-designing the criteria with you, then auditing them objectively** — instead of "asking another LLM if it looks fine."
+
+<br/>
+
+## ✨ Why use it
+
+|  |  |
+|---|---|
+| 🎯 **One line → verifiable criteria** | You approve only the **WHAT** — a plain-language, measurable acceptance table. The machine writes and audits the **HOW** (the bash). You never review scripts. |
+| 🔁 **Unattended, in the conversation** | The main agent becomes the master: dispatches workers, runs the criteria, keeps going on failure. **No terminal**, and a Stop-gate won't let it quit early. |
+| 🛡️ **Reward-hacking resistant** | Before sealing, the criteria must reject empty *and* cheating solutions. Sealing locks a checksum, so a worker can't quietly move the goalposts mid-run. |
+| 🧠 **Doesn't give up** | At a dead-end it first has `goal-decider` critically vet the "stuck" claim, then `goal-brainstormer` (fable 5) generates fresh approaches — it escalates to you only once creative options run dry. |
+| 🔋 **Quota-aware** | Reads claude-hud usage: downgrades the model when high, waits out the window at the ceiling — all in-conversation. |
+| 🧩 **Standard plugin** | One command to install. 6 slash commands, 9 specialized sub-agents, zero config. |
+
+<br/>
+
+## 🚀 Install
+
+> Requires [Claude Code](https://docs.claude.com/en/docs/claude-code). In Claude Code, run:
+
+```bash
+/plugin marketplace add lqzzy/goal-driven-cc
 /plugin install goal-driven@goal-driven-cc
 ```
 
-启用后得到:命令 `/goal-driven:new|run|status`;子代理 `goal-analyst / criteria-designer / criteria-auditor / goal-worker / goal-verifier`;裸命令 `gdcc`、`gd-audit`;两个 hook(Stop 门 + PreToolUse 守卫,**仅任务 arm 后生效,平时零干扰**)。
+Ready to use — no extra setup.
 
----
+<br/>
 
-## 快速开始
+## 🧭 Quick start
 
-**全自动建立一个目标(对话里):**
-```
-/goal-driven:new 实现一个线程安全的 LRU 缓存,容量满时淘汰最久未用项
-```
-Claude 会:反问 2~3 问 → 写 GOAL → 造判据+对抗基线 → 自审到盖章 → 让你确认。满意后 `/goal-driven:run` 就在**同一个对话里**跑到判据全绿。
-
-**先体会机械管线(内置示例,零 LLM 消耗):**
-```bash
-cd examples/is-prime
-gdcc check     # 记分板,当前 FAIL
-gdcc audit     # empty/cheat 必挂、reference 必过、无 flaky、够快 → PASS
-gdcc seal      # 审核过 + 确认"未实现必挂" + 锁校验和
-gdcc run       # 无人值守外部循环(或直接在对话里 /goal-driven:run)
-```
-
----
-
-## 判据 = 逐条记分板(master 看得到"为什么失败")
-
-`CRITERIA.sh` 每条验收要求一行,用两个助手:
+**The easy path** — describe a goal, answer a few questions, then walk away:
 
 ```bash
-check C1 "单元测试通过"   -- python3 -m unittest discover -s tests -q   # 确定性:能测的
-check C2 "p95 < 200ms"    -- python3 bench/p95.py --max-ms 200
-soft  C3 "报告清晰"       judge/c3.md "报告是否含 p95 数字及测法?"       # 软条件:调独立严格判据
+/goal-driven:go refactor src/parser until every test in tests/ passes with no lint errors
 ```
 
-跑出来是逐条记分板,master(和 Stop-hook)据此把 `[FAIL]` 条目连原因派给 worker:
+Prefer step-by-step control? Split it in two:
 
-```
-[PASS] C1    单元测试通过
-[FAIL] C2    p95 < 200ms
-         | p95=240ms exceeds 200ms
-RESULT: 1 criterion(s) FAILED   → exit 1
+```bash
+/goal-driven:new  <goal>   # co-design goal / criteria / tech plan with you → seal (stops for you to launch)
+/goal-driven:run           # drive it unattended until the criteria are genuinely green
 ```
 
-**软条件(`soft` / `gdcc judge`)**:无法机械判定的要求(文案/设计),交给一个**全新、只读、严格、独立于 worker** 的 `gdcc judge` 实例裁决,折成 0/1 进记分板。于是同一个退出码契约同时覆盖"硬"和"软",Stop-hook 一并强制。纯不可机械验证的目标,`CRITERIA.sh` 可以只有 `soft` 行。
+<br/>
 
----
+## 🎯 What it solves
 
-## 判据审核:把"自动审核"变成客观事实
+Typical agent loops have two chronic problems:
 
-`gdcc audit` 用对抗-变异实测校准传感器。盖章前判据必须通过:
+1. **They need babysitting** — you keep coming back to confirm and click *continue*.
+2. **They reward-hack** — to "make the tests green" they may hardcode, weaken checks, or game the goal.
 
-| # | 元判据 | 机械验证 | 防的是 |
-|---|---|---|---|
-| 2 | 判别力下界 | `baselines/empty/` 空解必判 **FAIL** | 判据太松 |
-| 3 | 判别力上界 | `baselines/reference/` 参考解必判 **PASS**(可选) | 判据太严 |
-| 4 | 不可作弊 | `baselines/cheat_*/` 作弊解必判 **FAIL** | reward-hacking |
-| 5 | 无 flaky | 连跑 N 次结论一致 | 传感器抖动 |
-| 6 | 够快 | 单次判据 < 预算 | 循环不起来 |
+**Goal-Driven** treats coding as a **closed-loop control system**:
 
-缺 `empty/` 或 `cheat_*/` 直接失败(fail-closed)。语义覆盖(元判据 7)由 `criteria-auditor` 做覆盖矩阵复核。
+- **Criteria = sensor** — objectively measure *"is the goal met?"*
+- **Master (the main agent) = controller** — reads the error, dispatches work, never stops early.
+- **Worker (sub-agent) = actuator** — reads what's failing, makes the smallest real change.
 
-`gdcc seal` 盖章时还会:**验证判据对未实现的代码判 FAIL**(否则判据是空的)+ **锁定判据校验和**——之后 worker 若偷改 `CRITERIA.sh`,Stop-hook 和 `gdcc run` 会检测到校验和不符并停机报警。
+Your one job: **get the goal and criteria right up front, together with it.** After that the loop converges on its own — that's what *goal-driven* means.
 
----
+<br/>
 
-## 完成判定:pass^k(不靠侥幸)
+## 🔁 How it works
 
-判据要**连续 `GDCC_CONSECUTIVE_PASSES` 次通过**才算达成(默认 2)。这防"某轮侥幸"或"软判据抖动"。全绿后主 CC 还会起一个独立 `goal-verifier` 做最终防作弊 + 软条件复核,verdict 为 `ACHIEVED` 才真正停。
+Two nested loops: **Loop A** turns the goal into trustworthy criteria (co-designed with you); **Loop B** drives to all-green (unattended).
 
----
+```mermaid
+flowchart TB
+    G["🗣️ one-line goal"] --> A
 
-## 命令参考
+    subgraph A["Loop A · build trustworthy criteria — you approve the WHAT"]
+        direction TB
+        A1["Gate 1 · GOAL"] --> A2["Gate 2 · measurable criteria"] --> A3["Gate 3 · tech roadmap"]
+        A3 --> AU["audit (default: agent static review) → seal 🔒"]
+    end
 
-**Skills**
+    A --> B
 
-| 命令 | 作用 |
+    subgraph B["Loop B · unattended execution — in the conversation"]
+        direction TB
+        B1["plan"] --> B2["worker iterates"] --> B3{"gdcc check<br/>all green?"}
+        B3 -- no --> B4["stuck ladder: re-plan → VET → brainstorm → escalate"]
+        B4 --> B2
+        B3 -- yes --> B5["pass^k + independent final check ✅"]
+    end
+
+    B5 --> DONE["🎉 goal met"]
+```
+
+**The stuck ladder** — it gets creative before giving up; escalating to you is the *last* rung:
+
+```text
+worker keeps failing
+  → re-plan             cheap; clears most stalls
+  → goal-decider · VET  fable, skeptical: is it really stuck? any missed contradiction / angle?
+  → goal-brainstormer   fable, divergent: invert the assumption · cross-domain analogy · change the axis…
+  → ideas run dry → gdcc escalate → over to you, with "everything creative we tried" attached
+```
+
+<br/>
+
+## 🧩 Commands
+
+| Command | What it does |
 |---|---|
-| `/goal-driven:new <一句话>` | 环 A:澄清→设计判据→自审→盖章(不启动 worker) |
-| `/goal-driven:run` | 环 B:主 CC 当 master,在**对话里**循环到判据真过 |
-| `/goal-driven:status` | 看记分板、盖章/校验和、进度、下一步建议 |
+| `/goal-driven:go <goal>` | **One shot**: co-design criteria → seal → run to completion, unattended. The daily driver. |
+| `/goal-driven:new <goal>` | Co-design and seal the criteria only, then stop for you to launch. |
+| `/goal-driven:run` | Drive a sealed task unattended until every criterion is green. |
+| `/goal-driven:revise` | Re-define the goal / criteria / plan grounded in current progress (old version archived). |
+| `/goal-driven:brainstorm` | Manually inject creativity into a stuck task. |
+| `/goal-driven:status` | Progress, criteria scoreboard, seal & quota status. |
 
-**`gdcc` 子命令**
+<br/>
 
-| 子命令 | 作用 |
-|---|---|
-| `gdcc init` | 脚手架 `.goal-driven/` |
-| `gdcc check` | 跑判据一次,打印记分板 |
-| `gdcc judge --rubric <f> "<问题>"` | 起独立严格 verifier 判一个软条件,返回 0/1 |
-| `gdcc audit` | 机械变异审核 |
-| `gdcc seal` / `unseal` | 盖章(审核+基线+校验和)/ 撤销 |
-| `gdcc run [--max N] [--force] [--dry-run]` | 外部无人值守闭环(未盖章拦截) |
-| `gdcc status` / `arm` / `disarm` / `stop` / `resume` | 状态 / 开关会话门 / 停止恢复 |
+## 🛡️ Design principles
 
----
+- **You own the WHAT; the machine writes and audits the HOW.** You judge the goal, the measurable acceptance conditions, and the high-level route — all in plain language. The `CRITERIA.sh` / tests / baselines are written and checked by the machine. A clean split: **you verify "criteria = my intent"; the machine verifies "the script correctly measures the criteria."**
+- **The audit is an objective fact, not another LLM's opinion.** Mutation-style mechanical audits (`lite` / `full`) actually feed empty and cheating solutions to the criteria; the default `agent` level has a read-only sub-agent reason about the same thing statically — fast, no heavy execution.
+- **Sealing stops goalpost-moving.** Sealing just locks a criteria checksum (instant). While armed the guard blocks edits, and the checksum catches the one gap it can't — a worker rewriting the criteria through Bash.
+- **It never silently relaxes the goal.** An agent can't change the criteria on its own. To change them you go through `revise` (human-authorized, archived, auditable), or — at a true dead-end — it escalates to you after a fable review.
 
-## 模型分层(默认关,可按需开)
+<br/>
 
-默认**所有 agent 都继承你的会话模型**(不分层)。想省钱/提速再开:
+## ⚙️ Configuration
 
-- worker 换便宜模型:编辑 `agents/goal-worker.md` 的 `model: inherit` → `sonnet`;或外部循环设 `GDCC_MODEL=sonnet`。
-- 设计/审核/verify 想更强:把对应 agent 的 `model:` 设为 `opus`。
-- 软判据模型单独设:`GDCC_JUDGE_MODEL`。
+Per task, in `.goal-driven/config.env` (sensible defaults — you rarely touch these):
 
-推荐分层(可选):worker→sonnet,designer/auditor/verifier→opus。
+| Variable | Default | What it does |
+|---|---|---|
+| `GDCC_AUDIT_LEVEL` | `agent` | Criteria audit: `agent` (sub-agent static review, fastest) · `lite` (execute empty + cheat baselines) · `full` · `off`. |
+| `GDCC_CONSECUTIVE_PASSES` | `2` | Criteria must pass this many times in a row to count as met (pass^k, beats a lucky pass). |
+| `GDCC_QUOTA_PAUSE_AT` | `90` | 5h-usage % at which the run pauses and waits for the window to reset (headroom for in-flight calls). |
+| `GDCC_QUOTA_DOWNGRADE_AT` | `80` | Usage % at which the worker drops to a cheaper model. |
+| `GDCC_BRAINSTORM_ROUNDS` | `3` | Auto-brainstorm rounds at a dead-end before escalating to you. |
+| `GDCC_MODEL_*` | — | Per-role models: fable only for planner / decider / brainstormer; everyone else caps at opus, floors at sonnet, never haiku. |
 
----
+<br/>
 
-## 配置(`.goal-driven/config.env`)
+## ❓ FAQ
 
-```bash
-GDCC_MODEL=""                 # 外部循环 worker 模型;"" = 继承(不分层)
-GDCC_MAX_ITERS=100            # 迭代上限(也是 Stop-hook 上限)
-GDCC_MAX_DURATION=0           # gdcc run 墙钟上限秒(0=关)
-GDCC_CONSECUTIVE_PASSES=2     # pass^k:连续几次过才算达成
-GDCC_STALL_LIMIT=5            # 判据输出连续 N 轮不变则停
-GDCC_NOPROGRESS_LIMIT=3       # 代码连续 N 轮零改动则停
-GDCC_JUDGE_MODEL=""           # 软条件 verifier 模型
-GDCC_PERMISSION_MODE="acceptEdits"
-GDCC_SAFETY_PROFILE="standard"  # strict 还会挡 force-push/hard-reset
-GDCC_CRITERIA_BUDGET=120      # 单次判据最长秒(元判据6)
-GDCC_DETERMINISM_RUNS=3       # 无 flaky 复跑次数(元判据5)
-```
+<details>
+<summary><b>Will it cheat just to turn the criteria green?</b></summary>
+<br/>
+That's the whole point of the project. Before sealing, the criteria are checked for their ability to tell right from wrong — <b>an empty solution and a cheating solution must both be rejected</b>, or it won't seal. After sealing, the checksum is locked, so a worker rewriting the criteria mid-run is caught and halts the loop. You own whether the criteria match your intent; the machine owns whether the criteria script is gameable.
+</details>
 
----
+<details>
+<summary><b>Will it run forever and burn all my quota?</b></summary>
+<br/>
+No runaway. It reads claude-hud's usage cache: downgrades the model when high, and at the pause threshold (default 90%) waits in the background for the window to reset before resuming — all in the conversation. Usage data refreshes ~every 5 minutes (API limit), so the strategy is <i>headroom</i>, not pinpoint timing.
+</details>
 
-## ⚠️ 安全须知
+<details>
+<summary><b>What if the goal really can't be reached?</b></summary>
+<br/>
+It won't give up at the first setback, and it won't quietly relax the goal. At a dead-end, fable first critically vets the "stuck" claim (often finding a missed angle to keep going), then fable brainstorms novel approaches; <b>only once ideas are exhausted</b> does it <code>gdcc escalate</code> — handing you a full analysis to decide on.
+</details>
 
-无人值守 = agent 自动改文件/跑命令、无人逐条确认。请:
+<details>
+<summary><b>Do I need a terminal open the whole time?</b></summary>
+<br/>
+No terminal. The entire loop runs inside the Claude Code conversation (the main agent spawns Task sub-agents). Just keep the session open; for long unattended runs, <code>/clear</code> first or start a clean session with <code>claude --disallowedTools AskUserQuestion</code>.
+</details>
 
-- 在**一次性/可丢弃的 git 仓库或容器**里跑;`GDCC_COMMIT=1` 每轮快照可审计可回滚。
-- 环境里**不放密钥**;假设 worker 能碰到 shell 能碰到的一切。
-- 任务 arm 后,PreToolUse 守卫**硬禁 `git commit --no-verify`**(strict 档还挡 force-push/hard-reset);破坏性命令会记 `logs/governance.log`。
-- 完全放开需 `GDCC_PERMISSION_MODE=bypassPermissions`,只在沙箱用。
-- 只对**可自动验证**的目标使用;`goal-analyst` 会拒绝无法客观判定的目标。
-- worker 禁止篡改判据(校验和锁 + `goal-verifier` 抽查);判据全绿仍建议人工瞄一眼 diff。
+<br/>
 
----
+## 🗺️ Roadmap
 
-## 目录结构
+Goal-Driven is **alpha** — the core loop works today. Where it's headed:
 
-```
-goal-driven-cc/                     # 仓库根 = 插件根 = 市场根
-├── .claude-plugin/{plugin,marketplace}.json
-├── skills/{new,run,status}/SKILL.md
-├── agents/{goal-analyst,criteria-designer,criteria-auditor,goal-worker,goal-verifier}.md
-├── hooks/hooks.json                # Stop→stop-gate.sh, PreToolUse→guard.sh
-├── bin/{gdcc,gd-audit}             # 自动进 PATH 的裸命令
-├── scripts/{stop-gate,guard}.sh
-│   └── lib/{common,check,audit,judge}.sh
-├── templates/  examples/is-prime/  README.md  LICENSE  CHANGELOG.md
-```
+**Next**
+- 📚 **Criteria presets** — starter templates for common goals (tests-pass, perf budget, safe refactor, API contract) so you jump straight to review.
+- 🧵 **Parallel goals** — run and supervise several sealed goals at once.
+- 💾 **Resumable runs** — checkpoint a run and pick it up in a fresh session.
 
-每个任务状态在**你项目**的 `.goal-driven/`(GOAL/CRITERIA/baselines/config/PROGRESS + 运行时 logs/state);仓库 `.gitignore` 忽略运行时产物。
+**Exploring**
+- 📊 A live run dashboard — phases, scoreboard, token spend at a glance.
+- 🤖 CI mode — drive a goal to green as a GitHub Action.
+- 🔬 Self-mutation testing of the code under test, not just the criteria.
 
----
+Driving a goal we don't cover yet? [Open an issue](../../issues) — the roadmap follows what people actually build.
 
-## 语言约定
+<br/>
 
-面向 Claude 的 prompt(agents/skills/worker)一律**英文**;面向你的阶段汇报、澄清提问、状态总结、master 输出用**简体中文**。
+## 🤝 Contributing
 
-## 局限
+Issues and PRs welcome. Include how you verified your change; for criteria / audit changes, add adversarial baselines where you can.
 
-- 只适用于**可自动验证**的目标;不可机械判定的用 `soft`/`gdcc judge`,但那是有噪声的传感器(靠 pass^k + 独立实例 + 你的复核兜底)。
-- 长跑成本真实存在:每轮一次完整 agent 调用,`GDCC_MAX_ITERS/MAX_DURATION/CONSECUTIVE_PASSES` 是你的护栏。
+## 📄 License
 
-MIT License.
+[MIT](./LICENSE) © Qi Li
+
+<div align="center"><sub>Control theory, turning goals into results.</sub></div>

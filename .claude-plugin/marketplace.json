@@ -1,7 +1,7 @@
 {
   "name": "goal-driven-cc",
   "owner": {
-    "name": "qili"
+    "name": "Qi Li"
   },
   "description": "Goal-Driven workflow for Claude Code: one-line goal -> verifiable, self-audited criteria -> autonomous negative-feedback loop until the criteria pass.",
   "plugins": [
