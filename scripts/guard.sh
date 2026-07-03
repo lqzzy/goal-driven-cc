@@ -29,11 +29,11 @@ fi
 # commands so it can still wait-until-reset and resume (no deadlock).
 if [ "${GDCC_QUOTA_GATE:-1}" = 1 ]; then
   gpct="$(gd_quota_pct5 2>/dev/null || true)"
-  if [ -n "$gpct" ] && [ "$gpct" -ge "${GDCC_QUOTA_PAUSE_AT:-97}" ]; then
+  if [ -n "$gpct" ] && [ "$gpct" -ge "${GDCC_QUOTA_PAUSE_AT:-90}" ]; then
     case "$cmd" in
       *"gdcc quota"*|*"gdcc status"*|*"reset-epoch"*|*"date +%s"*) : ;;  # master control — allow
       *)
-        echo "goal-driven quota-gate: 5h usage ${gpct}% >= ${GDCC_QUOTA_PAUSE_AT:-97}% ceiling. STOP working now and return control to the master. The master must wait until the quota window resets (background: until [ \"\$(date +%s)\" -ge \"\$(gdcc quota reset-epoch)\" ]; do sleep 120; done) and then resume. Do not make further tool calls until then." >&2
+        echo "goal-driven quota-gate: 5h usage ${gpct}% >= ${GDCC_QUOTA_PAUSE_AT:-90}% ceiling. STOP working now and return control to the master. The master must wait until the quota window resets (background: until [ \"\$(date +%s)\" -ge \"\$(gdcc quota reset-epoch)\" ]; do sleep 120; done) and then resume. Do not make further tool calls until then." >&2
         exit 2 ;;
     esac
   fi

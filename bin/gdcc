@@ -11,8 +11,10 @@
 #   init [--goal "..."]     scaffold .goal-driven/ from templates
 #   check                   run the criteria once (prints the per-criterion scoreboard)
 #   judge [--rubric f] "Q"  strict independent LLM verdict for a soft criterion (0/1)
-#   audit                   mechanical mutation battery (meta 2-6)
-#   seal / unseal           seal criteria (audit + baseline-must-fail + checksum)
+#   audit                   mechanical mutation battery (lite/full; default level is 'agent' = subagent static review)
+#   seal / unseal           seal = lock a tamper-evidence checksum of the criteria (no audit; review happens beforehand)
+#   revise-begin ["why"]    enter revision mode: snapshot GOAL/CRITERIA/ROADMAP -> disarm + unseal
+#   escalate "reason"       record ESCALATION.md + trip the Stop-gate escape valve (pause for human)
 #   run [--max N] [--force] [--dry-run]   headless loop (fresh worker each iteration)
 #   status | arm | disarm | stop | resume | version | help
 # ============================================================================
@@ -42,7 +44,7 @@ load_config() {
   GDCC_AGENT_CMD="${GDCC_AGENT_CMD:-claude}"
   GDCC_MODEL_LOW="${GDCC_MODEL_LOW:-}"          # downgrade target when quota high
   GDCC_QUOTA_DOWNGRADE_AT="${GDCC_QUOTA_DOWNGRADE_AT:-80}"  # 5h util% -> use GDCC_MODEL_LOW
-  GDCC_QUOTA_PAUSE_AT="${GDCC_QUOTA_PAUSE_AT:-97}"          # 5h util% -> sleep until reset
+  GDCC_QUOTA_PAUSE_AT="${GDCC_QUOTA_PAUSE_AT:-90}"          # 5h util% -> halt + wait until reset (headroom for in-flight)
   GDCC_QUOTA_SLEEP="${GDCC_QUOTA_SLEEP:-1}"     # 1: sleep-until-reset when at pause threshold
   if [ -z "${GDCC_ALLOWED_TOOLS+x}" ]; then GDCC_ALLOWED_TOOLS=(Read Edit Write Grep Glob Bash Task TodoWrite); fi
   [ -f "$DIR/config.env" ] && { set -a; source "$DIR/config.env"; set +a; }
@@ -175,24 +177,30 @@ cmd_quota() {
   esac
 }
 
+# Background quota watcher: loop until 5h usage >= threshold, print one line, exit.
+# Run via Bash(run_in_background:true) so the master is re-invoked when it fires.
+# NOTE: data is only ~5min fresh (usage API limit) — pair with headroom, not precision.
+cmd_quota_watch() {
+  local thresh="${1:-${GDCC_QUOTA_PAUSE_AT:-90}}"
+  local interval="${GDCC_QUOTA_WATCH_INTERVAL:-60}"
+  while :; do
+    local p; p="$(gd_quota_pct5 2>/dev/null || true)"
+    if [ -n "$p" ] && [ "$p" -ge "$thresh" ]; then
+      echo "QUOTA_CEILING_HIT pct=${p}% thresh=${thresh}% resetEpoch=$(gd_iso_to_epoch "$(gd_quota_field '.data.fiveHourResetAt')" 2>/dev/null)"
+      return 0
+    fi
+    sleep "$interval"
+  done
+}
+
 cmd_seal() {
+  # seal does ONE thing: lock a tamper-evidence checksum of the criteria. It runs NO audit — the
+  # criteria are reviewed beforehand by the criteria-auditor subagent (advisory). seal always
+  # succeeds so it never gets in the way; the checksum is what stops a worker silently rewriting
+  # the goalposts mid-run (even via Bash, which the edit-guard can't catch). Extra args are ignored.
   require_task; mkdir -p "$DIR/logs"
-  local force=0; [ "${1:-}" = "--force" ] && force=1
-  # 1) mechanical audit must pass
-  if ! bash "$LIB/audit.sh" "$DIR" >/dev/null 2>&1; then
-    [ "$force" = 1 ] || gd_die "审核未通过,不能盖章。先 gdcc audit 看失败项。"
-  fi
-  # 2) baseline must fail: criteria must NOT already pass on the untouched repo
-  if bash "$LIB/check.sh" "$DIR" > "$DIR/baseline-failure.txt" 2>&1; then
-    [ "$force" = 1 ] || gd_die "判据在未实现的代码上竟然就通过了 -> 判据是空的/太弱。请让 criteria-designer 收紧(或 --force)。"
-  fi
-  # 3) record seal + checksum of the judge surface
-  {
-    echo "sealed_at=$(gd_now)"
-    echo "criteria_hash=$(gd_criteria_hash "$DIR")"
-    echo "baseline_failed=yes"
-  } > "$DIR/CRITERIA.sealed"
-  echo "✅ 判据已盖章:审核通过 + 已确认对未实现代码判 FAIL(初始失败签名存于 baseline-failure.txt)+ 判据校验和已锁定。"
+  { echo "sealed_at=$(gd_now)"; echo "criteria_hash=$(gd_criteria_hash "$DIR")"; } > "$DIR/CRITERIA.sealed"
+  echo "✅ 判据已盖章:校验和已锁定(篡改会被检测)。审核由 agent 事先完成,不在此阻挡。"
 }
 cmd_unseal() { require_task; rm -f "$DIR/CRITERIA.sealed"; echo "已撤销盖章。"; }
 cmd_arm() {
@@ -241,6 +249,32 @@ PY
 }
 cmd_stop()   { require_task; touch "$DIR/STOP"; echo "已请求停止(下一轮生效)。"; }
 cmd_resume() { require_task; rm -f "$DIR/STOP"; echo "已清除停止标记。"; }
+cmd_escalate() {
+  require_task
+  { echo "=== ESCALATION $(gd_now) ==="; echo "${*:-(no reason given)}"; echo; } >> "$DIR/ESCALATION.md"
+  touch "$DIR/STOP"
+  echo "已升级并暂停:分析记入 $DIR/ESCALATION.md,Stop 门放行等你定夺(gdcc resume 继续)。"
+}
+
+# Enter human-led revision mode: archive the current goal/criteria/route (auditable +
+# rollbackable), then disarm (guard goes inert -> edits allowed) and unseal (unlock the
+# checksum). The old goal is NEVER silently overwritten. Used by /goal-driven:revise.
+cmd_revise_begin() {
+  require_task; mkdir -p "$DIR/history"
+  local ts f
+  ts="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo snapshot)"
+  for f in GOAL.md CRITERIA.sh ROADMAP.md; do
+    [ -f "$DIR/$f" ] && cp "$DIR/$f" "$DIR/history/$ts-$f" 2>/dev/null || true
+  done
+  [ -d "$DIR/judge" ] && cp -R "$DIR/judge" "$DIR/history/$ts-judge" 2>/dev/null || true
+  cmd_disarm >/dev/null 2>&1 || true   # remove ACTIVE + restore AskUserQuestion; guard goes inert
+  rm -f "$DIR/CRITERIA.sealed"          # unseal so GOAL/CRITERIA become editable
+  { echo "=== REVISE-BEGIN $(gd_now) ==="; echo "snapshot: history/$ts-*"; echo "reason: ${*:-human-driven revision based on progress}"; echo; } >> "$DIR/decisions.log"
+  echo "已进入修订模式:"
+  echo " - 已快照当前 GOAL/CRITERIA/ROADMAP(+judge)到 $DIR/history/$ts-*(可审计/可回滚);"
+  echo " - 已 disarm(guard 失效,可编辑)+ unseal(校验和解锁);"
+  echo " - 现在基于当前进度与人共创重定,完成后 gdcc audit + gdcc seal 重新盖章。"
+}
 
 cmd_status() {
   require_task; load_state
@@ -346,15 +380,18 @@ case "$sub" in
   judge) cmd_judge "$@";;
   audit) cmd_audit "$@";;
   quota) cmd_quota "$@";;
+  quota-watch) cmd_quota_watch "$@";;
   seal) cmd_seal "$@";;
   unseal) cmd_unseal "$@";;
+  revise-begin) cmd_revise_begin "$@";;
   arm) cmd_arm "$@";;
   disarm) cmd_disarm "$@";;
   stop) cmd_stop "$@";;
   resume) cmd_resume "$@";;
+  escalate) cmd_escalate "$@";;
   status) cmd_status "$@";;
   run) cmd_run "$@";;
-  version) echo "goal-driven-cc gdcc 0.6.0";;
+  version) echo "goal-driven-cc gdcc 0.10.0";;
   help|-h|--help) cmd_help;;
   *) gd_die "未知子命令: $sub (试试 gdcc help)";;
 esac
