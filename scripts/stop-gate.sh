@@ -49,15 +49,22 @@ echo $((blocks + 1)) > "$DIR/hook_blocks"
 
 tail_out="$(tail -n 120 "$DIR/logs/criteria-latest.log" 2>/dev/null)"
 {
-  echo "The goal-driven criteria (the Judge) have NOT passed yet — this loop must continue, do not stop."
+  echo "The goal-driven criteria (the Judge) have NOT passed yet — do not stop; keep working (or escalate the RIGHT way, below)."
   echo
   echo "JUDGE SCOREBOARD (non-zero exit = goal not reached):"
   echo "$tail_out"
   echo
-  echo "Do this now:"
-  echo "1) Read the [x] lines above — those are what is still failing, with reasons."
-  echo "2) Spawn a fresh goal-worker (or fix directly) targeting the specific failing checks. Read .goal-driven/GOAL.md and the tail of PROGRESS.md first."
-  echo "3) Re-run the Judge: bash .goal-driven/CRITERIA.sh"
-  echo "4) Append one line to .goal-driven/PROGRESS.md (what changed, what's next). Do NOT edit CRITERIA.sh or the tests."
+  echo "Normal case — keep working:"
+  echo "1) Read the [FAIL] lines above — those are what's still failing, with reasons."
+  echo "2) Spawn a fresh goal-worker targeting the specific failing checks (read GOAL.md + PROGRESS.md tail first)."
+  echo "3) Re-run the Judge: bash .goal-driven/CRITERIA.sh ; append one line to PROGRESS.md. Do NOT edit CRITERIA.sh or the tests."
+  echo
+  echo "If you think a criterion is stuck/unreachable — do NOT decide that yourself, and do NOT stop or disarm:"
+  echo "A) Spawn goal-decider (model fable) to CRITICALLY vet the claim. It must hunt for contradictions and holes —"
+  echo "   e.g. weaker hardware/config outperforming this one, results that violate expected scaling, assumptions never"
+  echo "   actually measured, untried decompositions/angles. Give it the facts + the exact 'unreachable' argument."
+  echo "B) If goal-decider says RESUME → keep working on the angle it found (the claim was premature)."
+  echo "C) ONLY if it CONFIRMS genuinely blocked → run:  gdcc escalate \"<the vetted analysis + the decision you need>\""
+  echo "   That records ESCALATION.md and cleanly pauses for the human. Never escalate on your own judgment alone."
 } >&2
 exit 2
