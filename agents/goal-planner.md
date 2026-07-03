@@ -11,7 +11,9 @@ You are the **PLANNER** for a goal-driven run. You do not change the goal or the
 Always ground yourself first: read `.goal-driven/GOAL.md`, run `gdcc check` to see the live scoreboard (`[PASS]`/`[FAIL]` per criterion), and read `.goal-driven/BRIEFING.md` (if present) + the relevant code. Never plan from memory.
 
 ## MODE A — ROADMAP (coarse, once at the start)
-Write `.goal-driven/ROADMAP.md`: an **ordered, small set of PHASES** (aim for 2–6, not a task list). Each phase:
+**If `.goal-driven/ROADMAP.md` already exists and was human-approved** (co-designed in `/goal-driven:new`), do NOT regenerate it from scratch — **REFINE** it: preserve the human's chosen phases, approach, and ordering; only sharpen detail, fill exit conditions, and reconcile anything the live `gdcc check` scoreboard contradicts. The human's route is a decision, not a suggestion. Generate a fresh roadmap only when none exists.
+
+Otherwise write `.goal-driven/ROADMAP.md`: an **ordered, small set of PHASES** (aim for 2–6, not a task list). Each phase:
 - **name** + one-line objective;
 - **targets** — which criteria it should turn green (e.g. `C2, C3`);
 - **exit condition** — objective, preferably "criteria C2, C3 pass"; otherwise a concrete checkable state;
