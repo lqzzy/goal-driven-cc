@@ -47,6 +47,53 @@ gd_tree_hash() {
   git -C "$root" write-tree 2>/dev/null
 }
 
+# --- In-flight worker registry (background-worker awareness for the Stop gate) ---
+# When the master BACKGROUNDS a worker subagent and then yields the turn to await
+# it, the Stop gate must tell "a worker is churning, just wait" apart from "nothing
+# is running, quit". It can't share memory with the master/worker, so the signal
+# lives on disk: each in-flight worker = one file under .goal-driven/workers/<id>.
+# Liveness is bounded by an expiry (TTL) written into the marker — a subagent has
+# no OS pid the hook could probe, so if `worker end` is never recorded (e.g. the
+# worker crashed and the master was never re-invoked) the marker simply expires and
+# the gate resumes normal blocking. Inert (dir absent) for the synchronous loop.
+gd_workers_dir() { printf '%s\n' "$1/workers"; }
+
+# gd_worker_begin <task_dir> <id> <ttl_secs> [label] -- mark a worker in-flight.
+gd_worker_begin() {
+  local dir="$1" id="${2:-main}" ttl="${3:-1800}" label="${4:-}" now exp wdir
+  case "$ttl" in ''|*[!0-9]*) ttl=1800;; esac
+  now="$(date +%s)"; exp=$(( now + ttl ))
+  wdir="$(gd_workers_dir "$dir")"; mkdir -p "$wdir" 2>/dev/null || return 1
+  { echo "id=$id"; echo "label=$label"; echo "started=$now"; echo "expires=$exp"; } > "$wdir/$id"
+}
+
+# gd_worker_end <task_dir> <id> -- record a worker as returned.
+gd_worker_end() { rm -f "$(gd_workers_dir "$1")/${2:-main}" 2>/dev/null; }
+
+# gd_workers_clear <task_dir> -- drop the whole registry (run ended / fresh arm).
+gd_workers_clear() { rm -rf "$(gd_workers_dir "$1")" 2>/dev/null; }
+
+# gd_workers_live <task_dir> -- print ids of live (non-expired) workers, one per
+# line, reaping expired markers as a side effect. Return 0 if any live, else 1.
+gd_workers_live() {
+  local dir="$1" wdir now f exp id any=1
+  wdir="$(gd_workers_dir "$dir")"
+  [ -d "$wdir" ] || return 1
+  now="$(date +%s)"
+  for f in "$wdir"/*; do
+    [ -e "$f" ] || continue
+    exp="$(sed -n 's/^expires=//p' "$f" 2>/dev/null)"
+    case "$exp" in ''|*[!0-9]*) exp=0;; esac
+    if [ "$now" -lt "$exp" ]; then
+      id="$(sed -n 's/^id=//p' "$f" 2>/dev/null)"
+      printf '%s\n' "${id:-$(basename "$f")}"; any=0
+    else
+      rm -f "$f" 2>/dev/null   # expired / garbage -> reap
+    fi
+  done
+  return "$any"
+}
+
 # --- Quota (reads claude-hud's usage cache; best-effort) --------------------
 # claude-hud fetches the Anthropic usage API and caches it here every ~5 min.
 # We reuse that cache instead of re-authenticating. Missing cache => unknown.

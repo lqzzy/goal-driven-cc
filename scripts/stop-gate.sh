@@ -36,6 +36,23 @@ if [ -f "$DIR/CRITERIA.sealed" ]; then
   fi
 fi
 
+# --- in-flight worker defer (background-worker awareness) -------------------
+# If the master BACKGROUNDED a worker and is now yielding the turn to await it,
+# this is NOT "quitting": a worker is still churning, so the scoreboard would be a
+# torn read and pushing "spawn a fresh worker" would double-dispatch onto the same
+# files. Defer instead — allow the yield so the master rests until the worker's
+# completion notification re-invokes it; do NOT count it against hook_blocks. Each
+# marker carries a TTL, so a crashed worker whose end was never recorded self-heals
+# (the marker expires and the gate resumes blocking). Off with GDCC_INFLIGHT_GATE=0;
+# inert (no markers) for the pure synchronous loop, so it changes nothing there.
+if [ "${GDCC_INFLIGHT_GATE:-1}" != "0" ]; then
+  live="$(gd_workers_live "$DIR" 2>/dev/null || true)"
+  if [ -n "$live" ]; then
+    echo "goal-driven gate: a worker is still in flight ($(printf '%s' "$live" | tr '\n' ' '))— deferring, not re-dispatching. The master should wait for its completion (or 'gdcc stop' to end)." >&2
+    exit 0
+  fi
+fi
+
 # --- JUDGE, pass^k ---
 allpass=1
 for _ in $(seq 1 "$K"); do

@@ -15,6 +15,7 @@
 #   seal / unseal           seal = lock a tamper-evidence checksum of the criteria (no audit; review happens beforehand)
 #   revise-begin ["why"]    enter revision mode: snapshot GOAL/CRITERIA/ROADMAP -> disarm + unseal
 #   escalate "reason"       record ESCALATION.md + trip the Stop-gate escape valve (pause for human)
+#   worker begin|end|list   in-flight worker registry (background dispatch): defer the Stop gate while a worker runs
 #   run [--max N] [--force] [--dry-run]   headless loop (fresh worker each iteration)
 #   status | arm | disarm | stop | resume | version | help
 # ============================================================================
@@ -206,6 +207,7 @@ cmd_unseal() { require_task; rm -f "$DIR/CRITERIA.sealed"; echo "已撤销盖章
 cmd_arm() {
   require_task
   touch "$DIR/ACTIVE"; rm -f "$DIR/STOP" "$DIR/consec_pass" "$DIR/hook_blocks" "$DIR/auto_decide_count"
+  gd_workers_clear "$DIR"   # fresh run -> drop any stale in-flight markers from a prior run
   # Disable AskUserQuestion for this project so the main agent literally cannot pause
   # to ask (the reliable, platform-supported mechanism; hooks cannot answer it).
   mkdir -p "$ROOT/.claude" 2>/dev/null
@@ -227,7 +229,7 @@ PY
   echo "     claude --disallowedTools AskUserQuestion"
 }
 cmd_disarm() {
-  require_task; rm -f "$DIR/ACTIVE"
+  require_task; rm -f "$DIR/ACTIVE"; gd_workers_clear "$DIR"
   python3 - "$ROOT/.claude/settings.local.json" <<'PY' 2>/dev/null || true
 import json,sys,os
 p=sys.argv[1]
@@ -247,8 +249,39 @@ json.dump(d,open(p,"w"),indent=2)
 PY
   echo "已 disarm(并恢复 AskUserQuestion)。"
 }
-cmd_stop()   { require_task; touch "$DIR/STOP"; echo "已请求停止(下一轮生效)。"; }
+cmd_stop()   { require_task; touch "$DIR/STOP"; gd_workers_clear "$DIR"; echo "已请求停止(下一轮生效)。"; }
 cmd_resume() { require_task; rm -f "$DIR/STOP"; echo "已清除停止标记。"; }
+
+# In-flight worker registry — let the Stop gate tell "worker still churning, wait"
+# from "nothing running, quit". Call `begin` right before you BACKGROUND a worker,
+# `end` once it returns. Pure synchronous dispatch (blocking Task) never needs this.
+cmd_worker() {
+  require_task; load_config
+  local sub="${1:-list}"; shift 2>/dev/null || true
+  case "$sub" in
+    begin)
+      local id="main" ttl="${GDCC_WORKER_TTL:-$GDCC_ITER_TIMEOUT}" label=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --ttl)   ttl="$2";   shift 2;;
+        --label) label="$2"; shift 2;;
+        --id)    id="$2";    shift 2;;
+        *)       id="$1";    shift;;
+      esac; done
+      gd_worker_begin "$DIR" "$id" "$ttl" "$label"
+      echo "worker '$id' 已登记为在途 (TTL ${ttl}s)。worker 返回后请运行: gdcc worker end $id"
+      ;;
+    end)
+      if [ "${1:-}" = "--all" ]; then gd_workers_clear "$DIR"; echo "已清空在途 worker 登记表。"
+      else gd_worker_end "$DIR" "${1:-main}"; echo "worker '${1:-main}' 已标记完成。"; fi
+      ;;
+    list)
+      local live; live="$(gd_workers_live "$DIR" || true)"
+      if [ -n "$live" ]; then echo "在途 worker:"; printf '  - %s\n' $live
+      else echo "当前无在途 worker。"; fi
+      ;;
+    *) gd_die "worker 子命令: begin [id] [--ttl N] [--label ..] | end [id|--all] | list";;
+  esac
+}
 cmd_escalate() {
   require_task
   { echo "=== ESCALATION $(gd_now) ==="; echo "${*:-(no reason given)}"; echo; } >> "$DIR/ESCALATION.md"
@@ -388,6 +421,7 @@ case "$sub" in
   disarm) cmd_disarm "$@";;
   stop) cmd_stop "$@";;
   resume) cmd_resume "$@";;
+  worker) cmd_worker "$@";;
   escalate) cmd_escalate "$@";;
   status) cmd_status "$@";;
   run) cmd_run "$@";;
