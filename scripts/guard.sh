@@ -2,7 +2,7 @@
 # ============================================================================
 # guard.sh -- PreToolUse guard for autonomous goal-driven runs.
 # INERT unless the cwd tree has an ARMED .goal-driven task. When armed:
-#   * blocks edits to the sealed GOAL.md / CRITERIA.sh / judge/ (no moving the goalposts)
+#   * blocks edits to the sealed GOAL.md / CRITERIA.md (no moving the goalposts)
 #   * hard-blocks `--no-verify`; strict profile also blocks force-push / hard-reset
 #   * logs (does NOT block) obviously destructive commands
 # Blocking uses the PreToolUse contract: exit 2 + reason on stderr. Fail-open.
@@ -43,8 +43,8 @@ fi
 case "$tool" in
   Write|Edit|MultiEdit|NotebookEdit)
     case "$fpath" in
-      */.goal-driven/GOAL.md|*/.goal-driven/CRITERIA.sh|*/.goal-driven/judge/*)
-        echo "goal-driven guard: blocked an edit to the sealed goal/judge ($fpath). The success bar is fixed for this run — solve the goal, don't move the goalposts. If the goal is genuinely wrong, that must be escalated, not edited." >&2
+      */.goal-driven/GOAL.md|*/.goal-driven/CRITERIA.md)
+        echo "goal-driven guard: blocked an edit to the sealed goalposts ($fpath). The success bar is fixed for this run — solve the goal, don't move the goalposts. If the goal is genuinely wrong, that must be escalated, not edited." >&2
         exit 2;;
     esac
     ;;

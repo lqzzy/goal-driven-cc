@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared helpers for the goal-driven plugin (sourced by gdcc / gd-audit /
+# Shared helpers for the goal-driven plugin (sourced by gdcc /
 # judge / stop-gate / guard). Do not execute directly.
 
 GD_STATE_DIRNAME=".goal-driven"
@@ -27,24 +27,31 @@ gd_hash_file() {
 }
 
 # Hash the sealed surface so tampering with the goal OR the criteria is detectable.
-# Covers GOAL.md + CRITERIA.sh + anything the designer parks under .goal-driven/judge/.
-# (The success bar — goal and judge — is frozen once sealed.)
+# Covers GOAL.md + CRITERIA.md — the success bar the strict-verifier judges against.
+# (Frozen once sealed; a worker must never edit its own goalposts.)
 gd_criteria_hash() {
   local dir="$1" acc
-  acc="$(gd_hash_file "$dir/CRITERIA.sh") $(gd_hash_file "$dir/GOAL.md")"
-  if [ -d "$dir/judge" ]; then
-    acc="$acc $(find "$dir/judge" -type f -exec shasum {} + 2>/dev/null | awk '{print $1}' | sort | tr '\n' ' ')"
-  fi
+  acc="$(gd_hash_file "$dir/GOAL.md") $(gd_hash_file "$dir/CRITERIA.md")"
   printf '%s' "$acc" | (shasum 2>/dev/null || cksum) | awk '{print $1}'
 }
 
 # Git tree hash of the current working state (for no-progress detection).
 # Empty string if not a git repo.
 gd_tree_hash() {
-  local root="$1"
+  local root="$1" idx
   git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || { echo ""; return; }
-  git -C "$root" add -A >/dev/null 2>&1
-  git -C "$root" write-tree 2>/dev/null
+  # Fingerprint the CODE tree only — EXCLUDE the loop's own .goal-driven/ state, so
+  # writing verdict.json / logs / markers never counts as a "code change" (that would
+  # make every verdict instantly stale). Use a throwaway index so the user's staging
+  # area is left untouched.
+  idx="$(mktemp -u 2>/dev/null)"
+  if [ -n "$idx" ]; then
+    GIT_INDEX_FILE="$idx" git -C "$root" add -A -- . ':(exclude).goal-driven/' >/dev/null 2>&1
+    GIT_INDEX_FILE="$idx" git -C "$root" write-tree 2>/dev/null
+    rm -f "$idx"
+  else
+    git -C "$root" add -A >/dev/null 2>&1; git -C "$root" write-tree 2>/dev/null
+  fi
 }
 
 # --- In-flight worker registry (background-worker awareness for the Stop gate) ---
@@ -93,6 +100,16 @@ gd_workers_live() {
   done
   return "$any"
 }
+
+# --- Verdict cache (strict-verifier output the Stop gate reads) --------------
+# The strict-verifier writes verdict.txt (the scoreboard, for feedback) and, via
+# `gdcc verdict record`, verdict.json = {tree_hash, all_pass, pass_streak, ...}.
+# The Stop gate reads verdict.json ONLY — cheap, deterministic, never an LLM (an
+# LLM in the Stop hook would fork-bomb). A verdict is trustworthy only while its
+# tree_hash still matches the working tree; any code change makes it stale.
+gd_verdict_tree()   { sed -n 's/.*"tree_hash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1/verdict.json" 2>/dev/null | head -1; }
+gd_verdict_allpass(){ grep -Eq '"all_pass"[[:space:]]*:[[:space:]]*true' "$1/verdict.json" 2>/dev/null; }
+gd_verdict_streak() { local s; s="$(sed -n 's/.*"pass_streak"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$1/verdict.json" 2>/dev/null | head -1)"; printf '%s' "${s:-0}"; }
 
 # --- Quota (reads claude-hud's usage cache; best-effort) --------------------
 # claude-hud fetches the Anthropic usage API and caches it here every ~5 min.

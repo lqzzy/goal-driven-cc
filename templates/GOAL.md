@@ -2,8 +2,8 @@
 
 <!-- Canonical spec consumed by the subagents. Keep it in English. The analyst
      also gives the user a Chinese summary in chat. Every requirement listed
-     under "Success looks like" must map to at least one assertion in CRITERIA.sh
-     (meta-criterion 7, checked by the criteria-auditor). -->
+     under "Success looks like" must map 1:1 to a criterion in CRITERIA.md that
+     the strict-verifier can judge from concrete evidence. -->
 
 ## Intent
 <!-- One paragraph: what the user actually wants, in plain terms. -->

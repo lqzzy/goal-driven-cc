@@ -8,7 +8,7 @@ A Claude Code plugin that turns coding into a **closed control loop**: you defin
 
 <br/>
 
-[![version](https://img.shields.io/badge/version-0.10.0-2563eb?style=flat-square)](./CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.11.0-2563eb?style=flat-square)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-16a34a?style=flat-square)](./LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-8b5cf6?style=flat-square)](https://docs.claude.com/en/docs/claude-code)
 [![status](https://img.shields.io/badge/status-alpha-f59e0b?style=flat-square)](#-roadmap)
@@ -37,9 +37,9 @@ CC  ▸ ① co-design goal · criteria · plan with you   →  ✅ sealed
 
 |  |  |
 |---|---|
-| 🎯 **One line → verifiable criteria** | You approve only the **WHAT** — a plain-language, measurable acceptance table. The machine writes and audits the **HOW** (the bash). You never review scripts. |
+| 🎯 **One line → verifiable criteria** | Nail the goal with it, then it derives a plain-language `CRITERIA.md` acceptance bar you read and approve directly. A fresh, independent **strict-verifier** judges the work against it every iteration. |
 | 🔁 **Unattended, in the conversation** | The main agent becomes the master: dispatches workers, runs the criteria, keeps going on failure. **No terminal**, and a Stop-gate won't let it quit early. |
-| 🛡️ **Reward-hacking resistant** | Before sealing, the criteria must reject empty *and* cheating solutions. Sealing locks a checksum, so a worker can't quietly move the goalposts mid-run. |
+| 🛡️ **Reward-hacking resistant** | An independent strict-verifier judges only concrete evidence — it won't pass a stub or a shortcut, and its verdict is void the moment the code changes. Sealing locks a checksum, so a worker can't quietly move the goalposts mid-run. |
 | 🧠 **Doesn't give up** | At a dead-end it first has `goal-decider` critically vet the "stuck" claim, then `goal-brainstormer` (fable 5) generates fresh approaches — it escalates to you only once creative options run dry. |
 | 🔋 **Quota-aware** | Reads claude-hud usage: downgrades the model when high, waits out the window at the ceiling — all in-conversation. |
 | 🧩 **Standard plugin** | One command to install. 6 slash commands, 9 specialized sub-agents, zero config. |
@@ -101,17 +101,18 @@ Two nested loops: **Loop A** turns the goal into trustworthy criteria (co-design
 flowchart TB
     G["🗣️ one-line goal"] --> A
 
-    subgraph A["Loop A · build trustworthy criteria — you approve the WHAT"]
+    subgraph A["Loop A · agree the goalposts — you approve GOAL + CRITERIA.md"]
         direction TB
-        A1["Gate 1 · GOAL"] --> A2["Gate 2 · measurable criteria"] --> A3["Gate 3 · tech roadmap"]
-        A3 --> AU["audit (default: agent static review) → seal 🔒"]
+        A1["Gate 1 · GOAL"] --> A2["Gate 2 · CRITERIA.md (you read & approve)"]
+        A2 --> AU["seal 🔒 (lock checksum)"]
     end
 
     A --> B
 
     subgraph B["Loop B · unattended execution — in the conversation"]
         direction TB
-        B1["plan"] --> B2["worker iterates"] --> B3{"gdcc check<br/>all green?"}
+        B0["brainstorm → plan (roadmap, then each phase)"] --> B2["worker iterates"]
+        B2 --> BV["strict-verifier → verdict"] --> B3{"all green?"}
         B3 -- no --> B4["stuck ladder: re-plan → VET → brainstorm → escalate"]
         B4 --> B2
         B3 -- yes --> B5["pass^k + independent final check ✅"]
@@ -147,9 +148,9 @@ worker keeps failing
 
 ## 🛡️ Design principles
 
-- **You own the WHAT; the machine writes and audits the HOW.** You judge the goal, the measurable acceptance conditions, and the high-level route — all in plain language. The `CRITERIA.sh` / tests / baselines are written and checked by the machine. A clean split: **you verify "criteria = my intent"; the machine verifies "the script correctly measures the criteria."**
-- **The audit is an objective fact, not another LLM's opinion.** Mutation-style mechanical audits (`lite` / `full`) actually feed empty and cheating solutions to the criteria; the default `agent` level has a read-only sub-agent reason about the same thing statically — fast, no heavy execution.
-- **Sealing stops goalpost-moving.** Sealing just locks a criteria checksum (instant). While armed the guard blocks edits, and the checksum catches the one gap it can't — a worker rewriting the criteria through Bash.
+- **You own the goalposts; the machine drives to them.** You approve the goal and read + approve `CRITERIA.md` — a plain-language acceptance bar, no bash to audit. From there the loop plans, works, and verifies on its own.
+- **The sensor is a fresh, independent verifier.** Every iteration a read-only strict-verifier judges `CRITERIA.md` against the actual artifacts — it takes nobody's word, and its verdict is void the instant the code changes (tree-hash stamped). The Stop gate only reads that cached verdict; it never runs an LLM itself (that would fork-bomb the hook).
+- **Sealing stops goalpost-moving.** Sealing just locks a `GOAL.md` + `CRITERIA.md` checksum (instant). While armed the guard blocks edits, and the checksum catches the one gap it can't — a worker rewriting the goalposts through Bash.
 - **It never silently relaxes the goal.** An agent can't change the criteria on its own. To change them you go through `revise` (human-authorized, archived, auditable), or — at a true dead-end — it escalates to you after a fable review.
 
 <br/>
@@ -160,8 +161,7 @@ Per task, in `.goal-driven/config.env` (sensible defaults — you rarely touch t
 
 | Variable | Default | What it does |
 |---|---|---|
-| `GDCC_AUDIT_LEVEL` | `agent` | Criteria audit: `agent` (sub-agent static review, fastest) · `lite` (execute empty + cheat baselines) · `full` · `off`. |
-| `GDCC_CONSECUTIVE_PASSES` | `2` | Criteria must pass this many times in a row to count as met (pass^k, beats a lucky pass). |
+| `GDCC_CONSECUTIVE_PASSES` | `2` | Strict-verifier must return all-pass this many times in a row, on the same code, to count as met (pass^k, beats a flaky/lucky verification). |
 | `GDCC_QUOTA_PAUSE_AT` | `90` | 5h-usage % at which the run pauses and waits for the window to reset (headroom for in-flight calls). |
 | `GDCC_QUOTA_DOWNGRADE_AT` | `80` | Usage % at which the worker drops to a cheaper model. |
 | `GDCC_BRAINSTORM_ROUNDS` | `3` | Auto-brainstorm rounds at a dead-end before escalating to you. |
@@ -174,7 +174,7 @@ Per task, in `.goal-driven/config.env` (sensible defaults — you rarely touch t
 <details>
 <summary><b>Will it cheat just to turn the criteria green?</b></summary>
 <br/>
-That's the whole point of the project. Before sealing, the criteria are checked for their ability to tell right from wrong — <b>an empty solution and a cheating solution must both be rejected</b>, or it won't seal. After sealing, the checksum is locked, so a worker rewriting the criteria mid-run is caught and halts the loop. You own whether the criteria match your intent; the machine owns whether the criteria script is gameable.
+That's the whole point of the project. Every iteration a fresh, independent <b>strict-verifier</b> judges the work against <code>CRITERIA.md</code> from concrete evidence — it won't accept a stub, a hardcoded output, or an altered frozen input, and its verdict goes stale the instant the code changes. After sealing, the <code>GOAL.md</code> + <code>CRITERIA.md</code> checksum is locked, so a worker rewriting the goalposts mid-run is caught and halts the loop. You own whether the criteria match your intent (you read and approve them); the strict-verifier owns whether the work actually meets them.
 </details>
 
 <details>
@@ -217,7 +217,7 @@ Driving a goal we don't cover yet? [Open an issue](../../issues) — the roadmap
 
 ## 🤝 Contributing
 
-Issues and PRs welcome. Include how you verified your change; for criteria / audit changes, add adversarial baselines where you can.
+Issues and PRs welcome. Include how you verified your change; for criteria changes, make each criterion sharp and evidence-based so a stub can't pass it.
 
 ## 📄 License
 

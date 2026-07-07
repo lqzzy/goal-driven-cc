@@ -3,14 +3,15 @@
 # stop-gate.sh -- in-session negative-feedback gate (the deterministic floor).
 #
 # Wired as a Stop hook. When the master (the main agent) tries to end its turn,
-# this runs the criteria (the Judge). If the task is ARMED and the criteria have
-# not passed GDCC_CONSECUTIVE_PASSES times, it BLOCKS (exit 2) and feeds the
-# scoreboard back so the loop continues. INERT unless the cwd tree has an armed
-# .goal-driven task, so installing the plugin never disturbs normal sessions.
+# this READS the strict-verifier's cached verdict (verdict.json) — it never runs
+# an LLM itself (that would re-enter this same hook and fork-bomb). If the task is
+# ARMED and the verdict isn't fresh + all-pass + pass^k, it BLOCKS (exit 2) and
+# feeds back exactly why. INERT unless the cwd tree has an armed .goal-driven task,
+# so installing the plugin never disturbs normal sessions.
 #
-# Also enforces the seal checksum: if CRITERIA.sh was tampered with mid-run, it
-# blocks and demands the judge be restored (a worker must never edit its judge).
-# Fail-open: only the criteria decision blocks; internal errors never wedge you.
+# Also enforces the seal checksum: if GOAL.md/CRITERIA.md were tampered with mid-run
+# it blocks and demands they be restored (a worker must never edit its own goalposts).
+# Fail-open: only the verdict decision blocks; internal errors never wedge you.
 # ============================================================================
 set -uo pipefail
 source "$(dirname "$0")/lib/common.sh" 2>/dev/null || exit 0
@@ -31,7 +32,7 @@ mkdir -p "$DIR/logs" 2>/dev/null
 if [ -f "$DIR/CRITERIA.sealed" ]; then
   want="$(grep '^criteria_hash=' "$DIR/CRITERIA.sealed" 2>/dev/null | cut -d= -f2-)"
   if [ -n "$want" ] && [ "$(gd_criteria_hash "$DIR")" != "$want" ]; then
-    echo "goal-driven gate: the sealed CRITERIA.sh has been modified during this run. The judge must never be edited to make the goal pass. Restore .goal-driven/CRITERIA.sh from git (git checkout -- .goal-driven/CRITERIA.sh) and solve the goal for real." >&2
+    echo "goal-driven gate: the sealed GOAL.md/CRITERIA.md has been modified during this run. The goalposts must never be edited to make the goal pass. Restore them from git (git checkout -- .goal-driven/GOAL.md .goal-driven/CRITERIA.md) and solve the goal for real." >&2
     exit 2
   fi
 fi
@@ -53,35 +54,53 @@ if [ "${GDCC_INFLIGHT_GATE:-1}" != "0" ]; then
   fi
 fi
 
-# --- JUDGE, pass^k ---
-allpass=1
-for _ in $(seq 1 "$K"); do
-  ( cd "$ROOT" && bash "$DIR/CRITERIA.sh" ) > "$DIR/logs/criteria-latest.log" 2>&1 || { allpass=0; break; }
-done
-if [ "$allpass" = 1 ]; then rm -f "$DIR/hook_blocks"; exit 0; fi   # goal reached -> allow stop
+# --- verdict gate (reads the strict-verifier's cached verdict; never runs an LLM) ---
+# The Judge is the strict-verifier, which runs OUTSIDE this hook and writes
+# verdict.json. This gate only READS it: allow the stop iff the verdict is FRESH
+# (its tree_hash still matches the working tree), ALL-PASS, and has reached the
+# pass^k streak (GDCC_CONSECUTIVE_PASSES green verifications in a row). Anything
+# else blocks with the precise reason. An LLM must NEVER run here -> fork bomb.
+VF="$DIR/verdict.json"
+cur="$(gd_tree_hash "$ROOT" 2>/dev/null)"
+vt="$(gd_verdict_tree "$DIR")"
+fresh=1; { [ -n "$cur" ] && [ "$cur" != "$vt" ]; } && fresh=0
+if [ -f "$VF" ] && [ "$fresh" = 1 ] && gd_verdict_allpass "$DIR" && [ "$(gd_verdict_streak "$DIR")" -ge "$K" ]; then
+  rm -f "$DIR/hook_blocks"; exit 0                                  # goal genuinely reached -> allow stop
+fi
 
 blocks="$(cat "$DIR/hook_blocks" 2>/dev/null || echo 0)"
 [ "$blocks" -ge "$MAX" ] && exit 0                                  # runaway cap -> allow stop
 echo $((blocks + 1)) > "$DIR/hook_blocks"
 
-tail_out="$(tail -n 120 "$DIR/logs/criteria-latest.log" 2>/dev/null)"
+if [ ! -f "$VF" ]; then
+  reason="No verdict yet — the criteria have never been verified this run."
+  action="Spawn the strict-verifier subagent to judge CRITERIA.md against the artifacts (it writes verdict.txt, then runs 'gdcc verdict record')."
+elif [ "$fresh" = 0 ]; then
+  reason="The verdict is STALE — code changed since it was recorded (tree hash differs)."
+  action="Re-run the strict-verifier on the CURRENT code before stopping."
+elif ! gd_verdict_allpass "$DIR"; then
+  reason="The verdict has failing criteria (see the scoreboard below)."
+  action="Spawn a fresh goal-worker targeting the [FAIL] criteria (read GOAL.md + PROGRESS.md tail first), then re-verify."
+else
+  reason="Not enough consecutive green verifications yet (pass^k: need $K in a row, have $(gd_verdict_streak "$DIR"))."
+  action="Re-run the strict-verifier to extend the streak."
+fi
+tail_out="$(tail -n 120 "$DIR/verdict.txt" 2>/dev/null)"
 {
-  echo "The goal-driven criteria (the Judge) have NOT passed yet — do not stop; keep working (or escalate the RIGHT way, below)."
+  echo "The goal-driven criteria have NOT been met yet — do not stop; keep working (or escalate the RIGHT way, below)."
   echo
-  echo "JUDGE SCOREBOARD (non-zero exit = goal not reached):"
-  echo "$tail_out"
+  echo "WHY: $reason"
+  echo "DO:  $action"
   echo
-  echo "Normal case — keep working:"
-  echo "1) Read the [FAIL] lines above — those are what's still failing, with reasons."
-  echo "2) Spawn a fresh goal-worker targeting the specific failing checks (read GOAL.md + PROGRESS.md tail first)."
-  echo "3) Re-run the Judge: bash .goal-driven/CRITERIA.sh ; append one line to PROGRESS.md. Do NOT edit CRITERIA.sh or the tests."
+  echo "LATEST VERDICT (strict-verifier scoreboard):"
+  echo "${tail_out:-(none recorded yet)}"
   echo
   echo "If you think a criterion is stuck/unreachable — do NOT decide that yourself, and do NOT stop or disarm:"
-  echo "A) Spawn goal-decider (model fable) to CRITICALLY vet the claim. It must hunt for contradictions and holes —"
-  echo "   e.g. weaker hardware/config outperforming this one, results that violate expected scaling, assumptions never"
-  echo "   actually measured, untried decompositions/angles. Give it the facts + the exact 'unreachable' argument."
+  echo "A) Spawn goal-decider (model fable) to CRITICALLY vet the claim — hunt for contradictions, untested assumptions, untried angles."
   echo "B) If goal-decider says RESUME → keep working on the angle it found (the claim was premature)."
   echo "C) ONLY if it CONFIRMS genuinely blocked → run:  gdcc escalate \"<the vetted analysis + the decision you need>\""
   echo "   That records ESCALATION.md and cleanly pauses for the human. Never escalate on your own judgment alone."
+  echo
+  echo "NEVER edit GOAL.md or CRITERIA.md to pass — the seal checksum catches it and halts the loop."
 } >&2
 exit 2

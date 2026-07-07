@@ -2,7 +2,7 @@
 # ============================================================================
 # judge.sh -- `gdcc judge` : a STRICT, INDEPENDENT LLM verdict for one
 # criterion that cannot be checked mechanically. Returns exit 0 (PASS) / 1 (FAIL)
-# so it composes inside CRITERIA.sh like any other check:
+# a reusable building block (the strict-verifier can call it for one hard question):
 #
 #     gdcc judge --rubric rubric.md "Does the report include p95 latency numbers?"
 #

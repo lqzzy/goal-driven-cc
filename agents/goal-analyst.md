@@ -23,7 +23,7 @@ A goal-driven loop only runs unattended if success is **automatically decidable*
    - **Assumptions** — everything you inferred rather than were told.
 
 ## Discipline
-Fewer, sharper requirements over many vague ones. Do not design tests or write CRITERIA.sh — stop at the spec. Keep every requirement traceable.
+Fewer, sharper requirements over many vague ones. Do not write CRITERIA.md — stop at the spec; the criteria-designer derives the acceptance bar from it. Keep every requirement traceable.
 
 ## Report to caller (简体中文)
 一句话复述目标;"成功的样子"要点;关键假设(请用户确认);是否可自动验证(是 / 否+可验证替代)。

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.11.0 (2026-07-07)
+
+Simpler structure: a strict-verifier + verdict cache replaces the CRITERIA.sh / adversarial-baseline / audit machinery, and every planner is now preceded by a brainstormer.
+
+- **The sensor is now a strict-verifier, not a bash script.** `CRITERIA.md` (plain-language,
+  human-readable acceptance criteria) replaces `CRITERIA.sh`. Each iteration a fresh, read-only
+  **strict-verifier** subagent judges `CRITERIA.md` against the actual artifacts and writes
+  `verdict.txt`; `gdcc verdict record` stamps `verdict.json` with the code's tree hash + all_pass +
+  the pass^k streak. **The Stop gate now READS `verdict.json`** (cheap, deterministic) instead of
+  running the criteria — an LLM verifier can never run inside the Stop hook (it would re-enter the
+  hook and fork-bomb), so verification runs OUTSIDE the hook and the gate just reads its cached result.
+- **Freshness by tree-hash.** A verdict is trusted only while its stamped code tree-hash matches the
+  working tree; any code change makes it stale and the gate demands a re-verify. `gd_tree_hash` now
+  fingerprints the code tree EXCLUDING `.goal-driven/`, so writing verdict/logs never counts as a change.
+- **Phase A is shorter.** `/goal-driven:new` / `:go` now = Gate 1 GOAL (human-approved) → Gate 2
+  `CRITERIA.md` (the human reads and approves it directly — it's human-auditable, unlike bash) → seal.
+  The technical roadmap moved into loop B. **Removed: the spec-first acceptance table, adversarial
+  baselines, `criteria-auditor`, `gdcc audit` / `gd-audit`, `GDCC_AUDIT_*`, and `SOFT.md`** — the
+  strict-verifier judges everything, so there is nothing to audit and no separate soft-criteria path.
+- **Every planner is preceded by a brainstormer.** Both the roadmap planner and each phase planner now
+  run **brainstorm → plan**: `goal-brainstormer` (fable) first diverges on the best / fastest / most
+  robust routes, then `goal-planner` (fable) evaluates and commits. The brainstormer gained a **PRE-PLAN
+  mode** (default, before each planner) distinct from its **RESCUE mode** (the stuck ladder).
+- **Seal now covers `GOAL.md` + `CRITERIA.md`**; the guard blocks edits to those; `gdcc worker` in-flight
+  tracking and pass^k are unchanged in spirit (pass^k is now k consecutive green verifications on the
+  same code). Bump plugin/marketplace/gdcc to 0.11.0.
+
 ## 0.10.0 (2026-07-03)
 
 Human-led co-design in loop A; cheap machine sanity check instead of heavy auto-audit.
