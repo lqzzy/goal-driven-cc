@@ -1,6 +1,6 @@
 ---
 name: goal-worker
-description: Use this agent to make one iteration of real progress on a sealed goal-driven task. Invoke it when the JUDGE scoreboard has [FAIL] lines and you need code changed to turn them green — e.g. "drive the goal-driven loop forward", "fix the failing criteria", "make the next iteration". The external `gdcc run` loop invokes an equivalent worker automatically.
+description: Use this agent to make one iteration of real progress on a sealed goal-driven task. Invoke it when the verdict scoreboard has [FAIL] lines and you need code changed to turn them green — e.g. "drive the goal-driven loop forward", "fix the failing criteria", "make the next iteration". The master spawns a fresh worker each iteration of the in-conversation loop.
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: inherit
 maxTurns: 45

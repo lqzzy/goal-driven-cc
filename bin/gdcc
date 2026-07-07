@@ -2,22 +2,19 @@
 # ============================================================================
 # gdcc -- Goal-Driven orchestrator + toolbox.
 #
-# Primary workflow lives IN the Claude conversation (the /goal-driven:run skill
-# makes the main agent the master; it calls `gdcc check` and spawns worker /
-# verifier subagents). gdcc also provides an optional headless loop (`gdcc run`)
-# for long unattended runs, and the shared primitives both modes use.
+# The whole workflow lives IN the Claude conversation: the /goal-driven:run skill
+# makes the main agent the master; it spawns worker / strict-verifier subagents and
+# drives these commands. gdcc is a thin toolbox of primitives — there is NO headless
+# loop (removed; the loop IS the conversation).
 #
 # Subcommands:
 #   init [--goal "..."]     scaffold .goal-driven/ from templates
 #   check                   read the last strict-verifier verdict (scoreboard + freshness; exit 0 iff fresh & all-pass)
 #   verdict record|show     record: stamp verdict.json (tree hash + all_pass + pass^k streak) from verdict.txt
-#   judge [--rubric f] "Q"  strict independent LLM verdict for one question (0/1); building block for the verifier
-#   audit                   DEPRECATED (strict-verifier replaces the adversarial-baseline audit)
-#   seal / unseal           seal = lock a tamper-evidence checksum of the criteria (no audit; review happens beforehand)
+#   seal / unseal           seal = lock a tamper-evidence checksum of GOAL.md + CRITERIA.md
 #   revise-begin ["why"]    enter revision mode: snapshot GOAL/CRITERIA/ROADMAP -> disarm + unseal
 #   escalate "reason"       record ESCALATION.md + trip the Stop-gate escape valve (pause for human)
 #   worker begin|end|list   in-flight worker registry (background dispatch): defer the Stop gate while a worker runs
-#   run [--max N] [--force] [--dry-run]   headless loop (fresh worker each iteration)
 #   status | arm | disarm | stop | resume | version | help
 # ============================================================================
 set -uo pipefail
@@ -34,87 +31,13 @@ TEMPLATES="$GDCC_ROOT/templates"
 require_task() { DIR="$(gd_find_task_dir "$PWD")" || gd_die "当前目录树下没有 .goal-driven/,先运行: gdcc init"; ROOT="$(dirname "$DIR")"; }
 
 load_config() {
-  GDCC_MODEL="${GDCC_MODEL:-}"
-  GDCC_MAX_ITERS="${GDCC_MAX_ITERS:-100}"
-  GDCC_PERMISSION_MODE="${GDCC_PERMISSION_MODE:-acceptEdits}"
+  # Only what the in-conversation commands (worker TTL, quota, model matrix) need.
   GDCC_ITER_TIMEOUT="${GDCC_ITER_TIMEOUT:-1800}"
-  GDCC_MAX_DURATION="${GDCC_MAX_DURATION:-0}"
-  GDCC_STALL_LIMIT="${GDCC_STALL_LIMIT:-5}"
-  GDCC_NOPROGRESS_LIMIT="${GDCC_NOPROGRESS_LIMIT:-3}"
-  GDCC_CONSECUTIVE_PASSES="${GDCC_CONSECUTIVE_PASSES:-2}"
-  GDCC_COMMIT="${GDCC_COMMIT:-1}"
-  GDCC_AGENT_CMD="${GDCC_AGENT_CMD:-claude}"
-  GDCC_MODEL_LOW="${GDCC_MODEL_LOW:-}"          # downgrade target when quota high
-  GDCC_QUOTA_DOWNGRADE_AT="${GDCC_QUOTA_DOWNGRADE_AT:-80}"  # 5h util% -> use GDCC_MODEL_LOW
-  GDCC_QUOTA_PAUSE_AT="${GDCC_QUOTA_PAUSE_AT:-90}"          # 5h util% -> halt + wait until reset (headroom for in-flight)
-  GDCC_QUOTA_SLEEP="${GDCC_QUOTA_SLEEP:-1}"     # 1: sleep-until-reset when at pause threshold
-  if [ -z "${GDCC_ALLOWED_TOOLS+x}" ]; then GDCC_ALLOWED_TOOLS=(Read Edit Write Grep Glob Bash Task TodoWrite); fi
+  GDCC_MODEL_LOW="${GDCC_MODEL_LOW:-}"
+  GDCC_QUOTA_DOWNGRADE_AT="${GDCC_QUOTA_DOWNGRADE_AT:-80}"
+  GDCC_QUOTA_PAUSE_AT="${GDCC_QUOTA_PAUSE_AT:-90}"
+  GDCC_QUOTA_SLEEP="${GDCC_QUOTA_SLEEP:-1}"
   [ -f "$DIR/config.env" ] && { set -a; source "$DIR/config.env"; set +a; }
-}
-
-save_state() {
-  cat > "$DIR/state.env" <<EOF
-GD_ITER=$GD_ITER
-GD_STATUS=$GD_STATUS
-GD_STALL=$GD_STALL
-GD_NOPROG=$GD_NOPROG
-GD_LAST_HASH=$GD_LAST_HASH
-GD_LAST_TREE=$GD_LAST_TREE
-GD_STARTED=$GD_STARTED
-GD_UPDATED=$(gd_now)
-EOF
-}
-load_state() {
-  GD_ITER=0; GD_STATUS=init; GD_STALL=0; GD_NOPROG=0; GD_LAST_HASH=""; GD_LAST_TREE=""; GD_STARTED="$(gd_now)"
-  [ -f "$DIR/state.env" ] && { set -a; source "$DIR/state.env"; set +a; }
-}
-
-# Headless strict-verifier prompt: judge CRITERIA.md against the artifacts and write
-# the verdict.txt scoreboard. (In-conversation runs use a Task strict-verifier instead.)
-build_verifier_prompt() {
-  cat <<EOF
-You are the STRICT VERIFIER — a fresh, read-only judge in a goal-driven loop. Judge ONLY concrete evidence; take nobody's word. Be strict and adversarial: missing/outdated/unreadable evidence => [FAIL]. Do NOT run the workload, build, or benchmark; do NOT edit any file except the verdict scoreboard.
-
-## GOAL
-$(cat "$DIR/GOAL.md" 2>/dev/null)
-
-## CRITERIA (judge each; each names its Evidence + Pass-when)
-$(cat "$DIR/CRITERIA.md" 2>/dev/null)
-
-## Task
-For EACH criterion, gather its named evidence (read files, inspect existing outputs) and decide [PASS]/[FAIL]. Write '.goal-driven/verdict.txt' EXACTLY in this format (one line per criterion; the loop machine-reads [FAIL]):
-
-== JUDGE SCOREBOARD ==
-[PASS] C1    <desc>
-[FAIL] C2    <desc>
-         | <reason: which evidence was missing/wrong>
------------------------
-RESULT: <N> criterion(s) FAILED
-EOF
-}
-
-run_verifier() {
-  if [ "$DRY_RUN" = 1 ]; then printf '== JUDGE SCOREBOARD ==\n[PASS] C0 dry-run\nRESULT: 0 criterion(s) FAILED\n' > "$DIR/verdict.txt"; return 0; fi
-  local model="${GDCC_JUDGE_MODEL:-${CUR_MODEL:-$GDCC_MODEL}}"
-  local args=(-p "$(build_verifier_prompt)" --permission-mode "$GDCC_PERMISSION_MODE" --output-format text)
-  [ -n "$model" ] && args+=(--model "$model")
-  if [ "$GDCC_PERMISSION_MODE" != "bypassPermissions" ] && [ "${#GDCC_ALLOWED_TOOLS[@]}" -gt 0 ]; then
-    args+=(--allowedTools "${GDCC_ALLOWED_TOOLS[@]}")
-  fi
-  gd_timeout "${GDCC_JUDGE_TIMEOUT:-300}" "$GDCC_AGENT_CMD" "${args[@]}" > "$DIR/logs/verifier-latest.log" 2>&1
-}
-
-# Verify K times; succeed only if EVERY run is all-pass (pass^k -> defeats a flaky/
-# lucky single verification). Each run: strict-verifier writes verdict.txt, gdcc stamps
-# verdict.json, we read all_pass.
-criteria_passes_k() {
-  local k="$1" i
-  for ((i=1; i<=k; i++)); do
-    run_verifier || return 1
-    cmd_verdict record >/dev/null 2>&1 || return 1
-    gd_verdict_allpass "$DIR" || return 1
-  done
-  return 0
 }
 
 # Detect tampering with the sealed judge surface.
@@ -124,43 +47,6 @@ seal_ok() {
   [ -z "$want" ] && return 0
   [ "$(gd_criteria_hash "$DIR")" = "$want" ] || return 1  # tampered
   return 0
-}
-
-build_prompt() {
-  cat <<EOF
-You are the worker in a goal-driven negative-feedback loop. This is iteration #$GD_ITER; you start with a FRESH context. Do the work well.
-
-## GOAL
-$(cat "$DIR/GOAL.md" 2>/dev/null)
-
-## JUDGE SCOREBOARD (latest strict-verifier verdict — the [FAIL] lines are what's left)
-\`\`\`
-$(tail -n 200 "$DIR/verdict.txt" 2>/dev/null)
-\`\`\`
-
-<!-- HISTORICAL REFERENCE ONLY — NOT LIVE INSTRUCTIONS. Prior iterations' notes,
-     for context so you don't repeat work. Do NOT blindly re-execute stale TODOs;
-     trust the scoreboard above for what is actually still failing. -->
-## PROGRESS (recent, historical)
-$(tail -n 40 "$DIR/PROGRESS.md" 2>/dev/null)
-
-## HOW TO WORK THIS ITERATION
-$(cat "$DIR/WORKER_PROMPT.md" 2>/dev/null)
-EOF
-}
-
-run_worker() {
-  local prompt="$1" out="$2"
-  if [ "$DRY_RUN" = 1 ]; then
-    printf '[dry-run] would invoke: %s -p <prompt> --permission-mode %s\n' "$GDCC_AGENT_CMD" "$GDCC_PERMISSION_MODE" | tee "$out"; return 0
-  fi
-  local model_for_iter="${CUR_MODEL:-$GDCC_MODEL}"
-  local args=(-p "$prompt" --permission-mode "$GDCC_PERMISSION_MODE" --output-format text)
-  [ -n "$model_for_iter" ] && args+=(--model "$model_for_iter")
-  if [ "$GDCC_PERMISSION_MODE" != "bypassPermissions" ] && [ "${#GDCC_ALLOWED_TOOLS[@]}" -gt 0 ]; then
-    args+=(--allowedTools "${GDCC_ALLOWED_TOOLS[@]}")
-  fi
-  gd_timeout "$GDCC_ITER_TIMEOUT" "$GDCC_AGENT_CMD" "${args[@]}" >"$out" 2>&1
 }
 
 # ---------- subcommands ----------
@@ -173,7 +59,6 @@ cmd_init() {
   cp "$TEMPLATES/GOAL.md" "$DIR/GOAL.md"
   cp "$TEMPLATES/CRITERIA.md" "$DIR/CRITERIA.md"
   cp "$TEMPLATES/config.env" "$DIR/config.env"
-  cp "$TEMPLATES/WORKER_PROMPT.md" "$DIR/WORKER_PROMPT.md"
   cp "$TEMPLATES/POLICY.md" "$DIR/POLICY.md"
   cp "$TEMPLATES/ROADMAP.md" "$DIR/ROADMAP.md"
   cp "$TEMPLATES/PLAN.md" "$DIR/PLAN.md"
@@ -229,8 +114,6 @@ cmd_verdict() {
   esac
 }
 
-cmd_judge() { bash "$LIB/judge.sh" "$@"; }
-cmd_audit() { echo "gdcc audit 已废弃:新模型由 strict-verifier 直接判 CRITERIA.md,不再用对抗 baseline 审计。" >&2; return 0; }
 
 cmd_quota() {
   local mode="${1:-human}"
@@ -379,109 +262,32 @@ cmd_revise_begin() {
 }
 
 cmd_status() {
-  require_task; load_state
+  require_task
   echo "== goal-driven 状态 =="
   echo "任务目录 : $DIR"
-  echo "迭代次数 : $GD_ITER   状态: $GD_STATUS   停滞: $GD_STALL   无进展: $GD_NOPROG"
   if [ -f "$DIR/CRITERIA.sealed" ]; then
     if seal_ok; then echo "判据盖章 : ✅ 已盖章(校验和一致)"; else echo "判据盖章 : ⚠️ 已盖章但 GOAL/CRITERIA 被改动(校验和不符!)"; fi
-  else echo "判据盖章 : ❌ 未盖章(gdcc run 会被拦截)"; fi
+  else echo "判据盖章 : ❌ 未盖章"; fi
+  if [ -f "$DIR/verdict.json" ]; then
+    local cur vt; cur="$(gd_tree_hash "$ROOT")"; vt="$(gd_verdict_tree "$DIR")"
+    if [ -n "$cur" ] && [ "$cur" != "$vt" ]; then echo "最新判定 : ⚠ 过期(代码已改,需重验)"
+    elif gd_verdict_allpass "$DIR"; then echo "最新判定 : ✅ 全绿(streak=$(gd_verdict_streak "$DIR"))"
+    else echo "最新判定 : ❌ 有未通过项"; fi
+  else echo "最新判定 : (尚无 verdict)"; fi
   [ -f "$DIR/ACTIVE" ] && echo "会话门   : ARMED (Stop-hook 生效)" || echo "会话门   : disarmed"
   printf '额度     : '; cmd_quota 2>/dev/null || echo "未知"
   echo "--- GOAL(首几行) ---"; head -n 6 "$DIR/GOAL.md" 2>/dev/null
   echo "--- 最近进展 ---"; tail -n 8 "$DIR/PROGRESS.md" 2>/dev/null || echo "(空)"
 }
 
-cmd_run() {
-  DRY_RUN=0; local force=0
-  while [ $# -gt 0 ]; do case "$1" in
-    --max) GDCC_MAX_ITERS_OVERRIDE="$2"; shift 2;;
-    --force) force=1; shift;;
-    --dry-run) DRY_RUN=1; shift;;
-    *) shift;; esac; done
-  require_task; load_config; load_state
-  [ -n "${GDCC_MAX_ITERS_OVERRIDE:-}" ] && GDCC_MAX_ITERS="$GDCC_MAX_ITERS_OVERRIDE"
-
-  if [ ! -f "$DIR/CRITERIA.sealed" ] && [ "$force" != 1 ]; then
-    gd_die "判据尚未盖章。先跑 /goal-driven:new(共创 GOAL/CRITERIA.md 并 gdcc seal);确要跳过用 --force。"
-  fi
-  mkdir -p "$DIR/logs"; touch "$DIR/ACTIVE"; rm -f "$DIR/STOP"
-  GD_STATUS=running; save_state
-  local start_epoch; start_epoch=$(date +%s)
-  gd_log "启动闭环:max=$GDCC_MAX_ITERS  pass^k=$GDCC_CONSECUTIVE_PASSES  model=${GDCC_MODEL:-inherit}  perm=$GDCC_PERMISSION_MODE  dry=$DRY_RUN"
-
-  while :; do
-    [ -f "$DIR/STOP" ] && { GD_STATUS=stopped; gd_log "收到停止请求,退出。"; break; }
-    [ "$GD_ITER" -ge "$GDCC_MAX_ITERS" ] && { GD_STATUS=maxed; gd_log "达到最大迭代 $GDCC_MAX_ITERS。"; break; }
-    if [ "$GDCC_MAX_DURATION" != 0 ] && [ $(( $(date +%s) - start_epoch )) -ge "$GDCC_MAX_DURATION" ]; then
-      GD_STATUS=timeout; gd_log "达到最大时长 ${GDCC_MAX_DURATION}s。"; break; fi
-
-    # tamper check
-    if seal_ok; then :; elif [ $? -eq 1 ]; then GD_STATUS=tampered; gd_log "⛔ CRITERIA 校验和不符(疑似被 worker 篡改),停机等人核查。"; break; fi
-
-    # JUDGE (pass^k)
-    if criteria_passes_k "$GDCC_CONSECUTIVE_PASSES"; then
-      GD_STATUS=success; gd_log "✅ 判据连续 $GDCC_CONSECUTIVE_PASSES 次通过,目标达成(共 $GD_ITER 次迭代)。"; break
-    fi
-
-    # stall detection (criteria output unchanged)
-    local h; h="$(gd_hash_file "$DIR/verdict.txt")"
-    if [ "$h" = "$GD_LAST_HASH" ]; then GD_STALL=$((GD_STALL+1)); else GD_STALL=0; fi
-    GD_LAST_HASH="$h"
-    [ "$GD_STALL" -ge "$GDCC_STALL_LIMIT" ] && { GD_STATUS=stalled; gd_log "⚠ 判据连续 $GD_STALL 轮无变化,退出等待人介入。"; break; }
-
-    # quota-aware: downgrade model or sleep-until-reset (best-effort; needs claude-hud cache)
-    CUR_MODEL="$GDCC_MODEL"
-    if [ -f "$(gd_quota_cache)" ]; then
-      local pct rmin; pct="$(gd_quota_pct5)"
-      if [ -n "$pct" ]; then
-        if [ "$pct" -ge "$GDCC_QUOTA_PAUSE_AT" ] && [ "$GDCC_QUOTA_SLEEP" = 1 ]; then
-          rmin="$(gd_quota_reset_min)"
-          if [ -n "$rmin" ] && [ "$rmin" -gt 0 ]; then
-            gd_log "额度 ${pct}% 触顶(≥${GDCC_QUOTA_PAUSE_AT}%),睡到窗口刷新(约 ${rmin} 分钟)..."
-            sleep $(( rmin * 60 + 60 ))
-          fi
-        elif [ "$pct" -ge "$GDCC_QUOTA_DOWNGRADE_AT" ] && [ -n "$GDCC_MODEL_LOW" ]; then
-          CUR_MODEL="$GDCC_MODEL_LOW"; gd_log "额度 ${pct}% 偏高(≥${GDCC_QUOTA_DOWNGRADE_AT}%),本轮降配 → $CUR_MODEL"
-        fi
-      fi
-    fi
-
-    # WORKER (fresh context)
-    GD_ITER=$((GD_ITER+1)); save_state
-    gd_log "迭代 #$GD_ITER:判据未过,派发 fresh worker(model=${CUR_MODEL:-inherit})..."
-    local wlog="$DIR/logs/iter-$(printf '%03d' "$GD_ITER").log"
-    run_worker "$(build_prompt)" "$wlog"
-
-    # snapshot + no-progress detection (repo tree unchanged N rounds)
-    local tree=""
-    if [ "$DRY_RUN" != 1 ] && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-      tree="$(gd_tree_hash "$ROOT")"
-      [ "$GDCC_COMMIT" = 1 ] && git -C "$ROOT" commit -q -m "gdcc iter $GD_ITER (criteria not yet green)" >/dev/null 2>&1 || true
-    fi
-    if [ -n "$tree" ] && [ "$tree" = "$GD_LAST_TREE" ]; then GD_NOPROG=$((GD_NOPROG+1)); else GD_NOPROG=0; fi
-    GD_LAST_TREE="$tree"
-    [ "$GD_NOPROG" -ge "$GDCC_NOPROGRESS_LIMIT" ] && { GD_STATUS=noprogress; gd_log "⚠ 连续 $GD_NOPROG 轮代码零改动,判无进展,退出。"; break; }
-
-    save_state
-    [ "$DRY_RUN" = 1 ] && { gd_log "[dry-run] 停在第一轮。"; break; }
-  done
-
-  save_state; rm -f "$DIR/ACTIVE"
-  echo; cmd_status
-}
-
-cmd_help() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+cmd_help() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- dispatch ----------
-DRY_RUN=0
 sub="${1:-help}"; shift || true
 case "$sub" in
   init) cmd_init "$@";;
   check) cmd_check "$@";;
   verdict) cmd_verdict "$@";;
-  judge) cmd_judge "$@";;
-  audit) cmd_audit "$@";;
   quota) cmd_quota "$@";;
   quota-watch) cmd_quota_watch "$@";;
   seal) cmd_seal "$@";;
@@ -494,7 +300,6 @@ case "$sub" in
   worker) cmd_worker "$@";;
   escalate) cmd_escalate "$@";;
   status) cmd_status "$@";;
-  run) cmd_run "$@";;
   version) echo "goal-driven-cc gdcc 0.11.0";;
   help|-h|--help) cmd_help;;
   *) gd_die "未知子命令: $sub (试试 gdcc help)";;

@@ -23,6 +23,11 @@ Simpler structure: a strict-verifier + verdict cache replaces the CRITERIA.sh / 
   run **brainstorm → plan**: `goal-brainstormer` (fable) first diverges on the best / fastest / most
   robust routes, then `goal-planner` (fable) evaluates and commits. The brainstormer gained a **PRE-PLAN
   mode** (default, before each planner) distinct from its **RESCUE mode** (the stuck ladder).
+- **Lighter — in-conversation only.** Removed the headless `gdcc run` loop and its helpers, plus the
+  now-unused `gdcc judge` (+ `judge.sh`) and the `WORKER_PROMPT.md` template. The loop IS the
+  conversation; `gdcc` is a thin toolbox. Dropped the config knobs those needed (`GDCC_MODEL`,
+  `GDCC_MAX_DURATION`, `GDCC_STALL_LIMIT`, `GDCC_NOPROGRESS_LIMIT`, `GDCC_COMMIT`, `GDCC_AGENT_CMD`,
+  `GDCC_PERMISSION_MODE`, `GDCC_ALLOWED_TOOLS`, `GDCC_JUDGE_*`). `gdcc status` is now verdict-aware.
 - **Seal now covers `GOAL.md` + `CRITERIA.md`**; the guard blocks edits to those; `gdcc worker` in-flight
   tracking and pass^k are unchanged in spirit (pass^k is now k consecutive green verifications on the
   same code). Bump plugin/marketplace/gdcc to 0.11.0.
